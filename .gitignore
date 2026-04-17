@@ -3,6 +3,7 @@ mcp-server/node_modules/
 dist/
 *.vsix
 *.log
+.cursor/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

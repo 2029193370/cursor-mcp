@@ -2,13 +2,14 @@
 	"name": "cursor-mcp",
 	"displayName": "Cursor MCP",
 	"description": "Cursor 侧栏多路 MCP 扩展：支持多项目与多工作区并行、多窗口独立通道；消息随附截图/文件、会话备忘等能力。",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"publisher": "litingfeng",
 	"author": {
 		"name": "litingfeng",
 		"email": "2029193370@qq.com"
 	},
 	"license": "MIT",
+	"icon": "resources/icon.png",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/2029193370/cursor-mcp.git"
@@ -94,6 +95,31 @@
 					"type": "number",
 					"default": 900000,
 					"description": "云端卡密吊销校验间隔（毫秒）：定期请求 /api/license/verify；范围 60000–86400000，默认 15 分钟。"
+				},
+				"cursorMcp.facheApiBaseUrl": {
+					"type": "string",
+					"default": "",
+					"description": "发车云端 API 根地址（无尾部斜杠），例如 https://your.host:8787。发车走 /api/fache/publish 与 /api/fache/pickup。留空时自动回退到 cursorMcp.redeemApiBaseUrl。"
+				},
+				"cursorMcp.facheTicketTtlMs": {
+					"type": "number",
+					"default": 600000,
+					"description": "云端 sk- 车票默认有效期（毫秒），发布时随 body 一同发给服务端，范围 60000–86400000，默认 10 分钟。"
+				},
+				"cursorMcp.fachePublishToken": {
+					"type": "string",
+					"default": "",
+					"description": "发车云端 publish 接口的访问令牌：若服务端设置了 PUBLISH_TOKEN，则本项需填同一值；请求时会带 Authorization: Bearer <token>。留空表示不带。"
+				},
+				"cursorMcp.updateFeedUrl": {
+					"type": "string",
+					"default": "https://api.github.com/repos/2029193370/cursor-mcp/releases/latest",
+					"description": "检查新版本的 GitHub Releases API 地址，默认指向本项目官方仓库，若 fork 请改为你自己的。"
+				},
+				"cursorMcp.updateAutoCheck": {
+					"type": "boolean",
+					"default": true,
+					"description": "启动后自动检查新版本；关闭后仅当手动点击「检查更新」时才查询。"
 				}
 			}
 		},

@@ -29,8 +29,455 @@ const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
 const os = __importStar(require("os"));
 const child_process_1 = require("child_process");
+const crypto = __importStar(require("crypto"));
+const http = __importStar(require("http"));
+const https = __importStar(require("https"));
 const license_1 = require("./license");
 const viewType = "cursorMcp.sidebar";
+/* ===== 发车（Cursor 设备指纹同步） ===== */
+const TICKET_PREFIX = "FCT1.";
+const FP_BACKUP_DIRNAME = "cursor-mcp-fp-backup";
+/** Cursor 用户目录（跨平台） */
+function getCursorUserDir() {
+    if (process.platform === "win32") {
+        const appdata = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+        return path.join(appdata, "Cursor");
+    }
+    if (process.platform === "darwin") {
+        return path.join(os.homedir(), "Library", "Application Support", "Cursor");
+    }
+    return path.join(os.homedir(), ".config", "Cursor");
+}
+function getCursorMachineIdFilePath() {
+    return path.join(getCursorUserDir(), "machineid");
+}
+function getCursorStorageJsonPath() {
+    return path.join(getCursorUserDir(), "User", "globalStorage", "storage.json");
+}
+function readWindowsMachineGuid() {
+    if (process.platform !== "win32")
+        return null;
+    try {
+        const r = (0, child_process_1.spawnSync)("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"], { encoding: "utf8", windowsHide: true });
+        if (r.status !== 0)
+            return null;
+        const m = /MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]+)/.exec(r.stdout || "");
+        return m ? m[1] : null;
+    }
+    catch {
+        return null;
+    }
+}
+/** 尝试以管理员身份写回 Windows MachineGuid */
+function writeWindowsMachineGuid(guid) {
+    if (process.platform !== "win32")
+        return { ok: false, msg: "仅 Windows 支持 MachineGuid 修改" };
+    const safe = String(guid || "").trim();
+    if (!/^[0-9a-fA-F-]{8,}$/.test(safe))
+        return { ok: false, msg: "MachineGuid 格式不合法" };
+    const sysRoot = process.env.SystemRoot || "C:\\Windows";
+    const psExe = path.join(sysRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const inner = `reg add \"HKLM\\SOFTWARE\\Microsoft\\Cryptography\" /v MachineGuid /t REG_SZ /d ${safe} /f`;
+    const script = `$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c ${inner}' -Verb RunAs -WindowStyle Hidden -PassThru -Wait; exit $p.ExitCode`;
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    try {
+        const r = (0, child_process_1.spawnSync)(psExe, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], { encoding: "utf8", windowsHide: true });
+        if (r.status === 0)
+            return { ok: true };
+        return { ok: false, msg: `写注册表失败（用户可能拒绝了管理员授权），退出码 ${r.status}` };
+    }
+    catch (e) {
+        return { ok: false, msg: String(e) };
+    }
+}
+/** 读取完整 Cursor 指纹 */
+function readCursorFingerprint() {
+    const fp = {
+        machineId: null,
+        devDeviceId: null,
+        telemetryMachineId: null,
+        macMachineId: null,
+        sqmId: null,
+        machineGuid: null,
+    };
+    try {
+        const mif = getCursorMachineIdFilePath();
+        if (fs.existsSync(mif)) {
+            const v = fs.readFileSync(mif, "utf-8").trim();
+            if (v)
+                fp.machineId = v;
+        }
+    }
+    catch {
+        // ignore
+    }
+    try {
+        const sp = getCursorStorageJsonPath();
+        if (fs.existsSync(sp)) {
+            const obj = JSON.parse(fs.readFileSync(sp, "utf-8"));
+            const pick = (k) => {
+                const v = obj?.[k];
+                return typeof v === "string" && v ? v : null;
+            };
+            fp.devDeviceId = pick("telemetry.devDeviceId");
+            fp.telemetryMachineId = pick("telemetry.machineId");
+            fp.macMachineId = pick("telemetry.macMachineId");
+            fp.sqmId = pick("telemetry.sqmId");
+        }
+    }
+    catch {
+        // ignore
+    }
+    fp.machineGuid = readWindowsMachineGuid();
+    return fp;
+}
+function getLocalIps() {
+    const out = [];
+    try {
+        const ifaces = os.networkInterfaces();
+        Object.keys(ifaces).forEach((name) => {
+            (ifaces[name] || []).forEach((ni) => {
+                if (ni && ni.family === "IPv4" && !ni.internal)
+                    out.push(`${name}:${ni.address}`);
+            });
+        });
+    }
+    catch {
+        // ignore
+    }
+    return out;
+}
+function toBase64UrlStr(buf) {
+    return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function fromBase64UrlStr(s) {
+    const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+    return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/") + pad, "base64");
+}
+/** 生成车票：FCT1.<base64url(JSON)> */
+function buildTicket(fp, hostname, ips) {
+    const payload = {
+        v: 1,
+        fp,
+        host: hostname || os.hostname() || "",
+        ip: ips || [],
+        ts: Date.now(),
+        nonce: crypto.randomBytes(4).toString("hex"),
+    };
+    return TICKET_PREFIX + toBase64UrlStr(Buffer.from(JSON.stringify(payload), "utf-8"));
+}
+function parseTicket(tok) {
+    const t = String(tok || "").trim();
+    if (!t.startsWith(TICKET_PREFIX))
+        return null;
+    try {
+        const json = fromBase64UrlStr(t.slice(TICKET_PREFIX.length)).toString("utf-8");
+        const o = JSON.parse(json);
+        if (!o || typeof o !== "object" || !o.fp || typeof o.fp !== "object")
+            return null;
+        return o;
+    }
+    catch {
+        return null;
+    }
+}
+/** 把车票指纹写入本机 Cursor（含备份） */
+function applyCursorFingerprint(fp) {
+    const touched = [];
+    const backupDir = path.join(getCursorUserDir(), FP_BACKUP_DIRNAME);
+    if (!fs.existsSync(backupDir))
+        fs.mkdirSync(backupDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const mif = getCursorMachineIdFilePath();
+    if (fp.machineId) {
+        try {
+            if (fs.existsSync(mif))
+                fs.copyFileSync(mif, path.join(backupDir, `machineid.${stamp}.bak`));
+            fs.mkdirSync(path.dirname(mif), { recursive: true });
+            fs.writeFileSync(mif, String(fp.machineId), "utf-8");
+            touched.push("machineid");
+        }
+        catch (e) {
+            throw new Error("写入 machineid 失败：" + String(e));
+        }
+    }
+    const sp = getCursorStorageJsonPath();
+    const hasStorageFields = fp.devDeviceId || fp.telemetryMachineId || fp.macMachineId || fp.sqmId;
+    if (hasStorageFields) {
+        try {
+            fs.mkdirSync(path.dirname(sp), { recursive: true });
+            let obj = {};
+            if (fs.existsSync(sp)) {
+                fs.copyFileSync(sp, path.join(backupDir, `storage.json.${stamp}.bak`));
+                try {
+                    obj = JSON.parse(fs.readFileSync(sp, "utf-8"));
+                }
+                catch {
+                    obj = {};
+                }
+            }
+            if (fp.devDeviceId)
+                obj["telemetry.devDeviceId"] = fp.devDeviceId;
+            if (fp.telemetryMachineId)
+                obj["telemetry.machineId"] = fp.telemetryMachineId;
+            if (fp.macMachineId)
+                obj["telemetry.macMachineId"] = fp.macMachineId;
+            if (fp.sqmId)
+                obj["telemetry.sqmId"] = fp.sqmId;
+            fs.writeFileSync(sp, JSON.stringify(obj, null, 2), "utf-8");
+            touched.push("storage.json");
+        }
+        catch (e) {
+            throw new Error("写入 storage.json 失败：" + String(e));
+        }
+    }
+    let guidResult = null;
+    if (process.platform === "win32" && fp.machineGuid) {
+        const cur = readWindowsMachineGuid();
+        if (cur && cur.toLowerCase() === String(fp.machineGuid).toLowerCase()) {
+            guidResult = { ok: true, skipped: true };
+        }
+        else {
+            guidResult = writeWindowsMachineGuid(fp.machineGuid);
+            if (guidResult.ok)
+                touched.push("MachineGuid(注册表)");
+        }
+    }
+    return { touched, backupDir, guidResult };
+}
+/** 获取发车云端 API 根地址：优先 facheApiBaseUrl，其次 redeemApiBaseUrl */
+function getFacheApiBaseUrl() {
+    const cfg = vscode.workspace.getConfiguration("cursorMcp");
+    const a = cfg.get("facheApiBaseUrl");
+    if (typeof a === "string" && a.trim())
+        return a.trim().replace(/\/+$/, "");
+    const b = cfg.get("redeemApiBaseUrl");
+    if (typeof b === "string" && b.trim())
+        return b.trim().replace(/\/+$/, "");
+    return "";
+}
+function getFacheTicketTtlMs() {
+    const cfg = vscode.workspace.getConfiguration("cursorMcp");
+    const v = cfg.get("facheTicketTtlMs");
+    const x = typeof v === "number" ? Math.floor(v) : 600000;
+    return Math.min(24 * 3600 * 1000, Math.max(60000, x));
+}
+function getFacheHttpTimeoutMs() {
+    const cfg = vscode.workspace.getConfiguration("cursorMcp");
+    const v = cfg.get("redeemTimeoutMs");
+    const x = typeof v === "number" ? Math.floor(v) : 20000;
+    return Math.min(120000, Math.max(3000, x));
+}
+/** 最小 HTTP 客户端：POST JSON，返回 JSON */
+function httpPostJson(baseUrl, pathPart, body, extraHeaders) {
+    return new Promise((resolve) => {
+        let u;
+        try {
+            u = new URL(baseUrl + pathPart);
+        }
+        catch (e) {
+            resolve({ ok: false, status: 0, err: "URL 不合法：" + String(e) });
+            return;
+        }
+        const payload = Buffer.from(JSON.stringify(body || {}), "utf-8");
+        const mod = u.protocol === "https:" ? https : http;
+        const headers = {
+            "content-type": "application/json",
+            "content-length": String(payload.length),
+            "user-agent": "cursor-mcp-fache/1",
+            ...(extraHeaders || {}),
+        };
+        const req = mod.request({
+            method: "POST",
+            hostname: u.hostname,
+            port: u.port || (u.protocol === "https:" ? 443 : 80),
+            path: u.pathname + (u.search || ""),
+            headers,
+        }, (res) => {
+            const chunks = [];
+            res.on("data", (c) => chunks.push(Buffer.from(c)));
+            res.on("end", () => {
+                const text = Buffer.concat(chunks).toString("utf-8");
+                let json = null;
+                try {
+                    json = text ? JSON.parse(text) : null;
+                }
+                catch {
+                    // 非 JSON 响应
+                }
+                resolve({ ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300, status: res.statusCode || 0, json, text });
+            });
+        });
+        req.on("error", (e) => resolve({ ok: false, status: 0, err: String(e) }));
+        req.setTimeout(getFacheHttpTimeoutMs(), () => {
+            try {
+                req.destroy(new Error("timeout"));
+            }
+            catch {
+                // ignore
+            }
+        });
+        req.write(payload);
+        req.end();
+    });
+}
+function isValidShortKey(k) {
+    return typeof k === "string" && /^sk-[A-Za-z0-9]{17}$/.test(k);
+}
+/* ===== 扩展自升级（GitHub Releases） ===== */
+function getUpdateFeedUrl() {
+    const cfg = vscode.workspace.getConfiguration("cursorMcp");
+    const v = cfg.get("updateFeedUrl");
+    return (typeof v === "string" && v.trim())
+        ? v.trim()
+        : "https://api.github.com/repos/2029193370/cursor-mcp/releases/latest";
+}
+/** 数字与预发后缀语义化对比：返回 -1 / 0 / 1 */
+function cmpSemver(a, b) {
+    const parse = (s) => String(s).replace(/^v/, "").split("-");
+    const [an, apre] = parse(a);
+    const [bn, bpre] = parse(b);
+    const ap = an.split(".").map((x) => parseInt(x, 10) || 0);
+    const bp = bn.split(".").map((x) => parseInt(x, 10) || 0);
+    const len = Math.max(ap.length, bp.length);
+    for (let i = 0; i < len; i++) {
+        const x = ap[i] ?? 0;
+        const y = bp[i] ?? 0;
+        if (x !== y)
+            return x < y ? -1 : 1;
+    }
+    if (!apre && !bpre)
+        return 0;
+    if (!apre)
+        return 1;
+    if (!bpre)
+        return -1;
+    return apre < bpre ? -1 : apre > bpre ? 1 : 0;
+}
+function httpGetJson(url) {
+    return new Promise((resolve) => {
+        let u;
+        try {
+            u = new URL(url);
+        }
+        catch {
+            resolve({ ok: false });
+            return;
+        }
+        const mod = u.protocol === "https:" ? https : http;
+        const req = mod.get({
+            hostname: u.hostname,
+            port: u.port || (u.protocol === "https:" ? 443 : 80),
+            path: u.pathname + (u.search || ""),
+            headers: {
+                "user-agent": "cursor-mcp-updater/1",
+                "accept": "application/vnd.github+json",
+            },
+        }, (res) => {
+            const chunks = [];
+            res.on("data", (c) => chunks.push(Buffer.from(c)));
+            res.on("end", () => {
+                const text = Buffer.concat(chunks).toString("utf-8");
+                try {
+                    resolve({ ok: (res.statusCode || 0) < 400, status: res.statusCode || 0, json: text ? JSON.parse(text) : null });
+                }
+                catch {
+                    resolve({ ok: false, status: res.statusCode || 0 });
+                }
+            });
+        });
+        req.on("error", () => resolve({ ok: false }));
+        req.setTimeout(15000, () => {
+            try {
+                req.destroy(new Error("timeout"));
+            }
+            catch {
+                // ignore
+            }
+        });
+    });
+}
+async function fetchLatestReleaseInfo() {
+    const r = await httpGetJson(getUpdateFeedUrl());
+    if (!r.ok || !r.json || typeof r.json !== "object")
+        return null;
+    const obj = r.json;
+    const tag = String(obj.tag_name || "").replace(/^v/, "");
+    if (!tag)
+        return null;
+    const assets = Array.isArray(obj.assets) ? obj.assets : [];
+    const vsix = assets.find((a) => a && typeof a.browser_download_url === "string" && /\.vsix$/i.test(String(a.name || "")));
+    return {
+        version: tag,
+        htmlUrl: typeof obj.html_url === "string" ? obj.html_url : "",
+        vsixUrl: vsix ? String(vsix.browser_download_url) : "",
+        vsixName: vsix ? String(vsix.name || "") : "",
+        notes: typeof obj.body === "string" ? obj.body.slice(0, 4000) : "",
+        publishedAt: typeof obj.published_at === "string" ? obj.published_at : "",
+    };
+}
+/** 跟随 302 下载 vsix 到本地 */
+function downloadToFile(url, destPath, maxRedirects = 6) {
+    return new Promise((resolve) => {
+        const go = (rawUrl, left) => {
+            let u;
+            try {
+                u = new URL(rawUrl);
+            }
+            catch {
+                resolve({ ok: false, err: "URL 解析失败" });
+                return;
+            }
+            const mod = u.protocol === "https:" ? https : http;
+            const req = mod.get({
+                hostname: u.hostname,
+                port: u.port || (u.protocol === "https:" ? 443 : 80),
+                path: u.pathname + (u.search || ""),
+                headers: { "user-agent": "cursor-mcp-updater/1", "accept": "*/*" },
+            }, (res) => {
+                const status = res.statusCode || 0;
+                if ([301, 302, 303, 307, 308].includes(status) && res.headers.location && left > 0) {
+                    res.resume();
+                    const next = new URL(res.headers.location, u).toString();
+                    go(next, left - 1);
+                    return;
+                }
+                if (status !== 200) {
+                    res.resume();
+                    resolve({ ok: false, err: `HTTP ${status}` });
+                    return;
+                }
+                fs.mkdirSync(path.dirname(destPath), { recursive: true });
+                const ws = fs.createWriteStream(destPath);
+                res.pipe(ws);
+                ws.on("finish", () => ws.close(() => resolve({ ok: true })));
+                ws.on("error", (e) => resolve({ ok: false, err: String(e) }));
+            });
+            req.on("error", (e) => resolve({ ok: false, err: String(e) }));
+            req.setTimeout(120000, () => {
+                try {
+                    req.destroy(new Error("timeout"));
+                }
+                catch {
+                    // ignore
+                }
+            });
+        };
+        go(url, maxRedirects);
+    });
+}
+async function installVsixFromFile(filePath) {
+    try {
+        await vscode.commands.executeCommand("workbench.extensions.installExtension", vscode.Uri.file(filePath));
+        return { ok: true };
+    }
+    catch (e) {
+        return { ok: false, err: String(e) };
+    }
+}
+
+
+
 /** MCP 在 mcp.json 中最多注册数量（与 cursor-mcp-1 … cursor-mcp-N 一致） */
 const MAX_SESSIONS = 32;
 const DEFAULT_SESSION_ORDER = ["1", "2", "3"];
@@ -738,6 +1185,293 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                     }
                     return;
                 }
+                if (cmd === "fcGetInfo") {
+                    const fp = readCursorFingerprint();
+                    const ips = getLocalIps();
+                    webviewView.webview.postMessage({
+                        command: "fcInfo",
+                        fp,
+                        ips,
+                        host: os.hostname(),
+                        userDir: getCursorUserDir(),
+                        platform: process.platform,
+                        defaultTtlMs: getFacheTicketTtlMs(),
+                    });
+                    return;
+                }
+                if (cmd === "fcCreateTicket") {
+                    try {
+                        const fp = readCursorFingerprint();
+                        if (!fp.machineId && !fp.devDeviceId && !fp.telemetryMachineId) {
+                            webviewView.webview.postMessage({
+                                command: "fcTicketResult",
+                                ok: false,
+                                msg: `未在 ${getCursorUserDir()} 读到 Cursor 指纹；请确认 Cursor 已安装并至少启动过一次`,
+                            });
+                            return;
+                        }
+                        const ticket = buildTicket(fp, os.hostname(), getLocalIps());
+                        webviewView.webview.postMessage({
+                            command: "fcTicketResult",
+                            ok: true,
+                            ticket,
+                            fp,
+                            host: os.hostname(),
+                            ips: getLocalIps(),
+                        });
+                    }
+                    catch (e) {
+                        webviewView.webview.postMessage({ command: "fcTicketResult", ok: false, msg: String(e) });
+                    }
+                    return;
+                }
+                if (cmd === "fcApplyTicket") {
+                    const tok = String(message.ticket ?? "");
+                    const parsed = parseTicket(tok);
+                    if (!parsed) {
+                        webviewView.webview.postMessage({
+                            command: "fcApplyResult",
+                            ok: false,
+                            msg: "无效车票：请复制以 FCT1. 开头的完整字符串",
+                        });
+                        return;
+                    }
+                    const confirm = await vscode.window.showWarningMessage(`将覆盖本机 Cursor 设备指纹（已自动备份）。\n来源机器：${parsed.host || "未知"}\n时间：${parsed.ts ? new Date(parsed.ts).toLocaleString() : "?"}\n\n生效前需退出并重启 Cursor。确认上车？`, { modal: true }, "确认上车");
+                    if (confirm !== "确认上车") {
+                        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "已取消" });
+                        return;
+                    }
+                    try {
+                        const r = applyCursorFingerprint(parsed.fp);
+                        const warn = r.guidResult && !r.guidResult.ok && !r.guidResult.skipped
+                            ? `\n注意：MachineGuid 未写入（${r.guidResult.msg || "需要管理员权限"}）。`
+                            : "";
+                        webviewView.webview.postMessage({
+                            command: "fcApplyResult",
+                            ok: true,
+                            msg: `已上车。已写入：${r.touched.join("、") || "（无变化）"}\n备份目录：${r.backupDir}${warn}\n\n请完全退出并重新启动 Cursor 让指纹生效。`,
+                            touched: r.touched,
+                            backupDir: r.backupDir,
+                        });
+                    }
+                    catch (e) {
+                        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: String(e) });
+                    }
+                    return;
+                }
+                if (cmd === "fcOpenBackupDir") {
+                    const dir = path.join(getCursorUserDir(), FP_BACKUP_DIRNAME);
+                    try {
+                        if (!fs.existsSync(dir))
+                            fs.mkdirSync(dir, { recursive: true });
+                        await vscode.env.openExternal(vscode.Uri.file(dir));
+                    }
+                    catch (e) {
+                        void vscode.window.showErrorMessage("打开备份目录失败：" + String(e));
+                    }
+                    return;
+                }
+                if (cmd === "fcCloudPublish") {
+                    const base = getFacheApiBaseUrl();
+                    if (!base) {
+                        webviewView.webview.postMessage({
+                            command: "fcCloudPublishResult",
+                            ok: false,
+                            msg: "未配置云端地址：请在 Cursor 设置中填入 cursorMcp.facheApiBaseUrl（或 cursorMcp.redeemApiBaseUrl）",
+                        });
+                        return;
+                    }
+                    const fp = readCursorFingerprint();
+                    if (!fp.machineId && !fp.devDeviceId && !fp.telemetryMachineId) {
+                        webviewView.webview.postMessage({
+                            command: "fcCloudPublishResult",
+                            ok: false,
+                            msg: `未在 ${getCursorUserDir()} 读到 Cursor 指纹；请确认 Cursor 已安装并至少启动过一次`,
+                        });
+                        return;
+                    }
+                    const reqTtl = Number(message.ttlMs);
+                    const ttlMs = Number.isFinite(reqTtl) && reqTtl > 0
+                        ? Math.min(24 * 3600 * 1000, Math.max(60000, Math.floor(reqTtl)))
+                        : getFacheTicketTtlMs();
+                    const tokenRaw = vscode.workspace.getConfiguration("cursorMcp").get("fachePublishToken");
+                    const token = typeof tokenRaw === "string" ? tokenRaw.trim() : "";
+                    const headers = token ? { authorization: "Bearer " + token } : undefined;
+                    const r = await httpPostJson(base, "/api/fache/publish", {
+                        fp,
+                        host: os.hostname(),
+                        ip: getLocalIps(),
+                        ttlMs,
+                    }, headers);
+                    if (r.status === 401) {
+                        webviewView.webview.postMessage({
+                            command: "fcCloudPublishResult",
+                            ok: false,
+                            msg: token
+                                ? "服务端拒绝：令牌不匹配。请检查 cursorMcp.fachePublishToken 与服务端 PUBLISH_TOKEN 是否一致"
+                                : "服务端要求令牌：请在 Cursor 设置中填写 cursorMcp.fachePublishToken",
+                        });
+                        return;
+                    }
+                    if (!r.ok) {
+                        const detail = r.err || (r.json && r.json.message) || r.text || `HTTP ${r.status}`;
+                        webviewView.webview.postMessage({ command: "fcCloudPublishResult", ok: false, msg: "发布失败：" + detail });
+                        return;
+                    }
+                    const key = r.json && typeof r.json.key === "string" ? r.json.key : "";
+                    const expiresAt = r.json && typeof r.json.expiresAt === "number" ? r.json.expiresAt : Date.now() + ttlMs;
+                    if (!isValidShortKey(key)) {
+                        webviewView.webview.postMessage({
+                            command: "fcCloudPublishResult",
+                            ok: false,
+                            msg: "服务端返回的 key 格式不合法（需为 sk- 开头 20 字符）",
+                        });
+                        return;
+                    }
+                    webviewView.webview.postMessage({
+                        command: "fcCloudPublishResult",
+                        ok: true,
+                        key,
+                        expiresAt,
+                        base,
+                    });
+                    return;
+                }
+                if (cmd === "fcCloudPickup") {
+                    const key = String(message.key ?? "").trim();
+                    if (!isValidShortKey(key)) {
+                        webviewView.webview.postMessage({
+                            command: "fcApplyResult",
+                            ok: false,
+                            msg: "密钥格式不正确（应形如 sk- 开头、共 20 位）",
+                        });
+                        return;
+                    }
+                    const base = getFacheApiBaseUrl();
+                    if (!base) {
+                        webviewView.webview.postMessage({
+                            command: "fcApplyResult",
+                            ok: false,
+                            msg: "未配置云端地址：请在 Cursor 设置中填入 cursorMcp.facheApiBaseUrl",
+                        });
+                        return;
+                    }
+                    const r = await httpPostJson(base, "/api/fache/pickup", { key });
+                    if (!r.ok) {
+                        const detail = r.err || (r.json && r.json.message) || r.text || `HTTP ${r.status}`;
+                        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "领取失败：" + detail });
+                        return;
+                    }
+                    const parsed = r.json || {};
+                    if (!parsed.fp || typeof parsed.fp !== "object") {
+                        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "服务端未返回指纹数据" });
+                        return;
+                    }
+                    const confirm = await vscode.window.showWarningMessage(`将覆盖本机 Cursor 设备指纹（已自动备份）。\n来源机器：${parsed.host || "未知"}\n时间：${parsed.ts ? new Date(parsed.ts).toLocaleString() : "?"}\n\n生效前需退出并重启 Cursor。确认上车？`, { modal: true }, "确认上车");
+                    if (confirm !== "确认上车") {
+                        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "已取消" });
+                        return;
+                    }
+                    try {
+                        const ar = applyCursorFingerprint(parsed.fp);
+                        const warn = ar.guidResult && !ar.guidResult.ok && !ar.guidResult.skipped
+                            ? `\n注意：MachineGuid 未写入（${ar.guidResult.msg || "需要管理员权限"}）。`
+                            : "";
+                        webviewView.webview.postMessage({
+                            command: "fcApplyResult",
+                            ok: true,
+                            msg: `已上车。已写入：${ar.touched.join("、") || "（无变化）"}\n备份目录：${ar.backupDir}${warn}\n\n请完全退出并重新启动 Cursor 让指纹生效。`,
+                            touched: ar.touched,
+                            backupDir: ar.backupDir,
+                        });
+                    }
+                    catch (e) {
+                        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: String(e) });
+                    }
+                    return;
+                }
+                if (cmd === "fcCopyTicket") {
+                    const t = String(message.ticket ?? "");
+                    if (t) {
+                        await vscode.env.clipboard.writeText(t);
+                        webviewView.webview.postMessage({ command: "fcClipboardResult", ok: true });
+                    }
+                    return;
+                }
+                if (cmd === "updateCheck") {
+                    const current = String(context.extension.packageJSON.version || "");
+                    const info = await fetchLatestReleaseInfo();
+                    if (!info) {
+                        webviewView.webview.postMessage({
+                            command: "updateCheckResult",
+                            ok: false,
+                            current,
+                            msg: "无法连接更新源（检查网络或 cursorMcp.updateFeedUrl）",
+                        });
+                        return;
+                    }
+                    const hasUpdate = cmpSemver(current, info.version) < 0;
+                    webviewView.webview.postMessage({
+                        command: "updateCheckResult",
+                        ok: true,
+                        current,
+                        latest: info.version,
+                        hasUpdate,
+                        hasVsix: !!info.vsixUrl,
+                        htmlUrl: info.htmlUrl,
+                        publishedAt: info.publishedAt,
+                        notes: info.notes,
+                    });
+                    return;
+                }
+                if (cmd === "updateInstall") {
+                    const current = String(context.extension.packageJSON.version || "");
+                    const info = await fetchLatestReleaseInfo();
+                    if (!info) {
+                        webviewView.webview.postMessage({ command: "updateInstallResult", ok: false, msg: "无法拉取最新 release" });
+                        return;
+                    }
+                    if (cmpSemver(current, info.version) >= 0) {
+                        webviewView.webview.postMessage({ command: "updateInstallResult", ok: false, msg: `已是最新：v${current}` });
+                        return;
+                    }
+                    if (!info.vsixUrl) {
+                        const go = await vscode.window.showWarningMessage(`v${info.version} 未附带 vsix 资源，打开 Releases 页面手动下载？`, { modal: false }, "打开 Releases");
+                        if (go === "打开 Releases" && info.htmlUrl) {
+                            await vscode.env.openExternal(vscode.Uri.parse(info.htmlUrl));
+                        }
+                        webviewView.webview.postMessage({ command: "updateInstallResult", ok: false, msg: "release 未附 vsix" });
+                        return;
+                    }
+                    const tmpPath = path.join(os.tmpdir(), `cursor-mcp-${info.version}.vsix`);
+                    webviewView.webview.postMessage({ command: "updateInstallProgress", step: "downloading", version: info.version });
+                    const dl = await downloadToFile(info.vsixUrl, tmpPath);
+                    if (!dl.ok) {
+                        webviewView.webview.postMessage({ command: "updateInstallResult", ok: false, msg: "下载失败：" + (dl.err || "unknown") });
+                        return;
+                    }
+                    webviewView.webview.postMessage({ command: "updateInstallProgress", step: "installing", version: info.version });
+                    const ins = await installVsixFromFile(tmpPath);
+                    if (!ins.ok) {
+                        const go = await vscode.window.showErrorMessage(`自动安装失败：${ins.err || "unknown"}\n\n是否打开 vsix 所在目录手动安装？`, { modal: false }, "打开目录");
+                        if (go === "打开目录") {
+                            await vscode.env.openExternal(vscode.Uri.file(path.dirname(tmpPath)));
+                        }
+                        webviewView.webview.postMessage({ command: "updateInstallResult", ok: false, msg: "安装失败：" + (ins.err || "") });
+                        return;
+                    }
+                    webviewView.webview.postMessage({
+                        command: "updateInstallResult",
+                        ok: true,
+                        version: info.version,
+                        msg: `v${info.version} 安装完成，请重新加载窗口使新版生效。`,
+                    });
+                    const reload = await vscode.window.showInformationMessage(`Cursor MCP 已升级到 v${info.version}，建议立即重新加载窗口。`, "立即重新加载", "稍后");
+                    if (reload === "立即重新加载") {
+                        await vscode.commands.executeCommand("workbench.action.reloadWindow");
+                    }
+                    return;
+                }
                 if (cmd === "ping") {
                     const text = String(message.text ?? "");
                     console.log(`[${viewType}] onDidReceiveMessage ping, text=`, text);
@@ -885,39 +1619,6 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
     .btn-trial:hover { background: rgba(137, 180, 250, 0.1); border-style: solid; }
     .license-foot { font-size: 9px; color: var(--text-muted); text-align: center; margin-top: 8px; line-height: 1.45; }
     #licenseFeedback { margin-top: 4px; }
-    .contact-strip {
-      margin-top: 12px;
-      padding: 10px 12px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: rgba(137, 180, 250, 0.07);
-      font-size: 10px;
-      line-height: 1.55;
-      color: var(--text-secondary);
-      text-align: center;
-    }
-    .contact-strip--gate { margin-top: 14px; }
-    .contact-strip-title {
-      font-weight: 600;
-      color: var(--accent);
-      margin-bottom: 6px;
-      font-size: 11px;
-    }
-    .contact-strip-line { margin: 3px 0; }
-    .contact-num {
-      font-family: ui-monospace, Consolas, monospace;
-      color: var(--text-primary);
-      user-select: all;
-    }
-    .contact-strip-note {
-      margin-top: 8px;
-      font-size: 9px;
-      color: var(--text-muted);
-    }
-    .contact-strip--main {
-      margin-top: 10px;
-      flex-shrink: 0;
-    }
     .app-layout {
       display: flex;
       flex: 1;
@@ -1136,6 +1837,29 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
       border: 1px solid var(--border);
       flex-shrink: 0;
     }
+    .update-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 9px;
+      font-size: 10px;
+      font-weight: 700;
+      border-radius: 999px;
+      border: 1px solid rgba(166, 227, 161, 0.55);
+      background: rgba(166, 227, 161, 0.12);
+      color: var(--success);
+      cursor: pointer;
+      letter-spacing: 0.02em;
+      transition: filter 0.15s, background 0.15s;
+    }
+    .update-badge:hover { filter: brightness(1.12); background: rgba(166, 227, 161, 0.2); }
+    .update-badge.busy { color: var(--warning); border-color: rgba(249, 226, 175, 0.55); background: rgba(249, 226, 175, 0.12); pointer-events: none; }
+    .update-badge .update-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 0 2px rgba(166, 227, 161, 0.25);
+      animation: pulse 1.8s infinite;
+    }
     .status-dot {
       width: 8px; height: 8px;
       border-radius: 50%;
@@ -1266,6 +1990,178 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
     .input-group textarea:focus { border-color: var(--accent); }
     .input-group input::placeholder,
     .input-group textarea::placeholder { color: var(--text-muted); }
+
+    .fc-section { border: 1px solid rgba(137, 180, 250, 0.25); }
+    .fc-emoji { margin-right: 4px; }
+    .fc-role-tabs {
+      display: flex;
+      gap: 6px;
+      margin: 6px 0 10px;
+    }
+    .fc-tab {
+      flex: 1;
+      padding: 6px 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg-primary);
+      color: var(--text-secondary);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .fc-tab:hover { color: var(--accent); border-color: var(--accent); }
+    .fc-tab.active { background: rgba(137, 180, 250, 0.15); color: var(--accent-hover); border-color: var(--accent); }
+    .fc-meta-box {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg-primary);
+      margin-bottom: 10px;
+      overflow: hidden;
+    }
+    .fc-meta-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      background: var(--bg-tertiary);
+      border-bottom: 1px solid var(--border);
+    }
+    .fc-meta-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-primary);
+      letter-spacing: 0.02em;
+    }
+    .fc-meta-time {
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-left: 6px;
+      font-family: ui-monospace, Consolas, monospace;
+      flex: 1;
+    }
+    .fc-meta {
+      font-size: 11px;
+      color: var(--text-secondary);
+      padding: 8px 10px;
+      font-family: ui-monospace, Consolas, monospace;
+      line-height: 1.6;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .fc-meta .fc-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      padding: 2px 0;
+    }
+    .fc-meta .fc-row + .fc-row { border-top: 1px dashed rgba(108,112,134,0.2); }
+    .fc-meta .fc-key {
+      color: var(--text-muted);
+      min-width: 120px;
+      flex-shrink: 0;
+      font-weight: 600;
+    }
+    .fc-meta .fc-val {
+      flex: 1;
+      color: var(--text-primary);
+      word-break: break-all;
+      user-select: all;
+      min-width: 0;
+    }
+    .fc-meta .fc-empty { color: var(--warning); font-style: italic; }
+    .fc-meta .fc-copy {
+      flex-shrink: 0;
+      padding: 1px 6px;
+      font-size: 10px;
+      color: var(--text-muted);
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .fc-meta .fc-copy:hover { color: var(--accent); border-color: var(--accent); }
+    .fc-meta .fc-copy:disabled { opacity: 0.3; cursor: not-allowed; }
+    .fc-ticket {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      font-size: 11px;
+      font-family: ui-monospace, Consolas, monospace;
+      outline: none;
+      resize: vertical;
+      min-height: 60px;
+      max-height: 180px;
+      margin-bottom: 8px;
+      word-break: break-all;
+    }
+    .fc-ticket:focus { border-color: var(--accent); }
+    .fc-key-box {
+      margin: 0 0 8px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(166, 227, 161, 0.35);
+      background: rgba(166, 227, 161, 0.08);
+    }
+    .fc-key-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .fc-key-label {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--success);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .fc-key-value {
+      flex: 1;
+      min-width: 180px;
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+      background: var(--bg-primary);
+      padding: 6px 10px;
+      border-radius: 6px;
+      user-select: all;
+      letter-spacing: 0.04em;
+      cursor: text;
+    }
+    .fc-key-hint {
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-top: 6px;
+    }
+    .fc-key-hint.expired { color: var(--error); }
+    .fc-ttl-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 0 0 8px;
+    }
+    .fc-ttl-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+    .fc-ttl-select, .fc-ttl-custom {
+      padding: 5px 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      font-size: 11px;
+      outline: none;
+    }
+    .fc-ttl-select:focus, .fc-ttl-custom:focus { border-color: var(--accent); }
+    .fc-ttl-custom { width: 90px; }
+    .fc-ttl-hint { flex: 1; min-width: 120px; }
 
     .feedback {
       margin-top: 8px;
@@ -1569,14 +2465,6 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
     <button type="button" class="btn-help-open" id="openHelpGateBtn">使用说明</button>
     <div class="feedback" id="licenseFeedback"></div>
     <p class="license-foot">试用与正式激活均可使用侧栏全部功能；到期后将返回本页。</p>
-    <div class="contact-strip contact-strip--gate">
-      <div class="contact-strip-title">购买卡密 · 交流群 · 技术支持</div>
-      <div class="contact-strip-line">QQ 群：<span class="contact-num">1091740923</span></div>
-      <div class="contact-strip-line">QQ：<span class="contact-num">3821703362</span></div>
-      <div class="contact-strip-line">QQ：<span class="contact-num">1919066559</span></div>
-      <div class="contact-strip-line">微信：<span class="contact-num">17519157525</span></div>
-      <div class="contact-strip-note">加群交流、购买卡密与技术支持</div>
-    </div>
   </div>
   <div class="app-layout" id="mainApp">
   <aside class="session-rail" id="sessionRail" aria-label="会话列表" style="width:88px">
@@ -1590,6 +2478,9 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
   <div class="header">
     <h2>Cursor MCP</h2>
     <span class="header-version" id="extVersionBadge" title="扩展版本">v${extensionVersion}</span>
+    <button type="button" class="update-badge" id="updateBadge" style="display:none" title="点击一键升级到最新版本">
+      <span class="update-dot"></span><span id="updateBadgeText">有新版</span>
+    </button>
     <div class="status-dot" id="statusDot" title="连接状态"></div>
     <span id="activeMcpHint" class="hint" style="margin-left:auto;font-size:10px;">当前：MCP-1</span>
     <button type="button" class="btn-help-header" id="openHelpMainBtn" title="查看详细使用说明">使用说明</button>
@@ -1667,6 +2558,78 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
     <div class="feedback" id="sendFeedback"></div>
   </div>
 
+  <div class="section fc-section">
+    <div class="section-head">
+      <div class="section-title"><span class="fc-emoji" aria-hidden="true">🚗</span>发车 / 上车</div>
+      <button class="btn btn-small" type="button" id="fcToggleRoleBtn" title="切换车头/乘客">切换身份</button>
+    </div>
+    <div class="fc-role-tabs" id="fcRoleTabs">
+      <button type="button" class="fc-tab active" data-role="driver">我是车头（生成车票）</button>
+      <button type="button" class="fc-tab" data-role="rider">我要上车（粘贴车票）</button>
+    </div>
+
+    <div class="fc-meta-box">
+      <div class="fc-meta-head">
+        <span class="fc-meta-title">本机 Cursor 设备指纹</span>
+        <span class="fc-meta-time" id="fcMetaTime">未读取</span>
+        <button class="btn btn-small" id="fcMetaRefreshBtn" type="button" title="重新读取">刷新</button>
+        <button class="btn btn-small" id="fcMetaCopyAllBtn" type="button" title="复制全部指纹为多行文本">复制全部</button>
+      </div>
+      <div class="fc-meta" id="fcDriverMeta">正在读取本机 Cursor 指纹…</div>
+    </div>
+
+    <div class="fc-panel" id="fcDriverPanel">
+      <div class="fc-ttl-row">
+        <label class="fc-ttl-label" for="fcTtlSelect">有效期</label>
+        <select id="fcTtlSelect" class="fc-ttl-select" title="sk- 密钥到期自动失效">
+          <option value="300000">5 分钟</option>
+          <option value="600000" selected>10 分钟</option>
+          <option value="1800000">30 分钟</option>
+          <option value="3600000">1 小时</option>
+          <option value="21600000">6 小时</option>
+          <option value="43200000">12 小时</option>
+          <option value="86400000">24 小时</option>
+          <option value="custom">自定义…</option>
+        </select>
+        <input type="number" id="fcTtlCustom" class="fc-ttl-custom" min="1" max="1440" step="1" placeholder="分钟" style="display:none" />
+        <span class="hint fc-ttl-hint" id="fcTtlHint">一次性领取；过期自动删除</span>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="fcCloudPubBtn" title="云端发车：生成 20 位 sk- 密钥，一次性领取">云端 sk- 密钥</button>
+        <button class="btn" id="fcGenBtn" title="本地发车：生成完整 FCT1. 车票，无需联网">本地 FCT1. 车票</button>
+        <button class="btn btn-small" id="fcOpenBackupBtn" title="打开备份目录">备份</button>
+      </div>
+
+      <div class="fc-key-box" id="fcKeyBox" style="display:none">
+        <div class="fc-key-line">
+          <span class="fc-key-label">sk-密钥</span>
+          <code class="fc-key-value" id="fcKeyValue" title="点击全选"></code>
+          <button class="btn btn-small" id="fcKeyCopyBtn">复制</button>
+        </div>
+        <div class="fc-key-hint" id="fcKeyExpires">—</div>
+      </div>
+
+      <textarea id="fcTicketOut" class="fc-ticket" rows="3" readonly placeholder="点击「本地 FCT1. 车票」后，此处显示可复制的长车票（完全离线可用）"></textarea>
+      <div class="btn-row">
+        <button class="btn btn-small" id="fcCopyBtn" disabled>复制 FCT1.</button>
+        <span class="hint">sk- 密钥走云端（需在设置中配置 <code>cursorMcp.facheApiBaseUrl</code>）；FCT1. 长车票不依赖服务器。</span>
+      </div>
+    </div>
+
+    <div class="fc-panel" id="fcRiderPanel" style="display:none">
+      <textarea id="fcTicketIn" class="fc-ticket" rows="3" placeholder="粘贴 sk- 密钥（20 位）或 FCT1. 长车票，插件会自动识别"></textarea>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="fcApplyBtn">上车（覆盖本机指纹）</button>
+        <button class="btn btn-small" id="fcOpenBackupBtn2" title="打开备份目录">备份目录</button>
+      </div>
+      <div class="hint">
+        上车前会自动把本机旧指纹备份到 <code>Cursor/cursor-mcp-fp-backup</code>。<strong>请先退出 Cursor 再点「上车」</strong>，写入后重新启动 Cursor 才会生效。Windows 上若车票含 MachineGuid，会弹出 UAC 请求管理员权限写注册表。
+      </div>
+    </div>
+
+    <div class="feedback" id="fcFeedback"></div>
+  </div>
+
   <div class="section">
     <div class="section-head">
       <div class="section-title">对话记录</div>
@@ -1682,14 +2645,6 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
         <div style="font-size: 10px; margin-top: 4px;">发送消息开始对话</div>
       </div>
     </div>
-  </div>
-  <div class="contact-strip contact-strip--main">
-    <div class="contact-strip-title">购买卡密 · 交流群 · 技术支持</div>
-    <div class="contact-strip-line">QQ 群：<span class="contact-num">1091740923</span></div>
-    <div class="contact-strip-line">QQ：<span class="contact-num">3821703362</span></div>
-    <div class="contact-strip-line">QQ：<span class="contact-num">1919066559</span></div>
-    <div class="contact-strip-line">微信：<span class="contact-num">17519157525</span></div>
-    <div class="contact-strip-note">加群交流、购买卡密与技术支持</div>
   </div>
   </div>
   </div>
@@ -2562,6 +3517,298 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
     });
 
     renderMessages();
+
+    /* ===== 自动检查更新 ===== */
+    (function setupAutoUpdate() {
+      var badge = document.getElementById('updateBadge');
+      var badgeText = document.getElementById('updateBadgeText');
+      if (!badge) return;
+      var latestVer = '';
+      function setBadge(state, text) {
+        badgeText.textContent = text;
+        badge.classList.toggle('busy', state === 'busy');
+        badge.style.display = '';
+      }
+      function hide() { badge.style.display = 'none'; }
+      badge.addEventListener('click', function () {
+        if (badge.classList.contains('busy')) return;
+        setBadge('busy', '下载中…');
+        vscodeApi.postMessage({ command: 'updateInstall' });
+      });
+      setTimeout(function () {
+        vscodeApi.postMessage({ command: 'updateCheck' });
+      }, 1500);
+      window.addEventListener('message', function (event) {
+        var msg = event.data;
+        if (!msg || !msg.command) return;
+        if (msg.command === 'updateCheckResult') {
+          if (msg.ok && msg.hasUpdate && msg.hasVsix) {
+            latestVer = msg.latest;
+            setBadge('ready', '有新版 v' + msg.latest);
+            badge.title = '点击一键升级：v' + msg.current + ' → v' + msg.latest;
+          } else if (msg.ok && msg.hasUpdate && !msg.hasVsix) {
+            latestVer = msg.latest;
+            setBadge('ready', '有新版 v' + msg.latest + '（需手动）');
+            badge.title = '点击打开 Releases 页面手动下载';
+          } else {
+            hide();
+          }
+        } else if (msg.command === 'updateInstallProgress') {
+          setBadge('busy', msg.step === 'downloading' ? '下载 v' + msg.version + '…' : '安装 v' + msg.version + '…');
+        } else if (msg.command === 'updateInstallResult') {
+          if (msg.ok) {
+            setBadge('ready', '已升级到 v' + msg.version);
+            badge.title = '请重新加载窗口生效';
+          } else {
+            setBadge('ready', '升级失败：点此重试');
+            badge.title = msg.msg || '升级失败，点此重试';
+          }
+        }
+      });
+    })();
+
+    /* ===== 发车/上车 UI ===== */
+    (function setupFaChe() {
+      var driverPanel = document.getElementById('fcDriverPanel');
+      var riderPanel = document.getElementById('fcRiderPanel');
+      var tabs = document.querySelectorAll('#fcRoleTabs .fc-tab');
+      var driverMeta = document.getElementById('fcDriverMeta');
+      var metaTimeEl = document.getElementById('fcMetaTime');
+      var metaRefreshBtn = document.getElementById('fcMetaRefreshBtn');
+      var metaCopyAllBtn = document.getElementById('fcMetaCopyAllBtn');
+      var genBtn = document.getElementById('fcGenBtn');
+      var lastFpInfo = null;
+      var openBackupBtn = document.getElementById('fcOpenBackupBtn');
+      var openBackupBtn2 = document.getElementById('fcOpenBackupBtn2');
+      var ticketOut = document.getElementById('fcTicketOut');
+      var copyBtn = document.getElementById('fcCopyBtn');
+      var ticketIn = document.getElementById('fcTicketIn');
+      var applyBtn = document.getElementById('fcApplyBtn');
+      var fbEl = document.getElementById('fcFeedback');
+      var roleToggleBtn = document.getElementById('fcToggleRoleBtn');
+      var cloudPubBtn = document.getElementById('fcCloudPubBtn');
+      var keyBox = document.getElementById('fcKeyBox');
+      var keyValueEl = document.getElementById('fcKeyValue');
+      var keyExpiresEl = document.getElementById('fcKeyExpires');
+      var keyCopyBtn = document.getElementById('fcKeyCopyBtn');
+      var ttlSelect = document.getElementById('fcTtlSelect');
+      var ttlCustom = document.getElementById('fcTtlCustom');
+      var keyExpiresAt = 0;
+      var keyTimer = null;
+      var FC_TTL_MIN_MS = 60 * 1000;
+      var FC_TTL_MAX_MS = 24 * 3600 * 1000;
+      function getSelectedTtlMs() {
+        if (!ttlSelect) return 600000;
+        if (ttlSelect.value === 'custom') {
+          var mins = parseInt(ttlCustom && ttlCustom.value, 10);
+          if (!mins || mins < 1) mins = 10;
+          return Math.min(FC_TTL_MAX_MS, Math.max(FC_TTL_MIN_MS, mins * 60 * 1000));
+        }
+        var v = parseInt(ttlSelect.value, 10);
+        return Math.min(FC_TTL_MAX_MS, Math.max(FC_TTL_MIN_MS, v || 600000));
+      }
+      if (ttlSelect) ttlSelect.addEventListener('change', function () {
+        if (ttlCustom) ttlCustom.style.display = ttlSelect.value === 'custom' ? '' : 'none';
+      });
+
+      function fcFeedback(type, text) {
+        if (!fbEl) return;
+        fbEl.className = 'feedback show ' + type;
+        fbEl.textContent = text;
+        if (type === 'success' || type === 'info') {
+          setTimeout(function () { fbEl.classList.remove('show'); }, 8000);
+        }
+      }
+
+      function switchRole(role) {
+        tabs.forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-role') === role); });
+        driverPanel.style.display = role === 'driver' ? '' : 'none';
+        riderPanel.style.display = role === 'rider' ? '' : 'none';
+      }
+      tabs.forEach(function (t) {
+        t.addEventListener('click', function () { switchRole(t.getAttribute('data-role')); });
+      });
+      if (roleToggleBtn) roleToggleBtn.addEventListener('click', function () {
+        var curDriver = driverPanel.style.display !== 'none';
+        switchRole(curDriver ? 'rider' : 'driver');
+      });
+
+      function row(key, val) {
+        var hasVal = !!val;
+        var safeVal = hasVal ? escapeHtml(val) : '（未读到）';
+        var valCls = hasVal ? 'fc-val' : 'fc-val fc-empty';
+        var copyAttr = hasVal ? ' data-fc-copy="' + escapeHtml(val) + '"' : ' disabled';
+        return '<div class="fc-row">' +
+          '<span class="fc-key">' + escapeHtml(key) + '</span>' +
+          '<span class="' + valCls + '">' + safeVal + '</span>' +
+          '<button type="button" class="fc-copy"' + copyAttr + ' title="复制">复制</button>' +
+          '</div>';
+      }
+      function renderDriverMeta(info) {
+        if (!driverMeta) return;
+        if (!info) { driverMeta.innerHTML = '<span class="fc-empty">读取失败</span>'; return; }
+        lastFpInfo = info;
+        var fp = info.fp || {};
+        var ips = Array.isArray(info.ips) ? info.ips.join(', ') : '';
+        driverMeta.innerHTML =
+          row('主机名', info.host || '') +
+          row('IPv4', ips) +
+          row('平台', info.platform || '') +
+          row('machineId', fp.machineId) +
+          row('devDeviceId', fp.devDeviceId) +
+          row('telemetry.machineId', fp.telemetryMachineId) +
+          row('telemetry.macMachineId', fp.macMachineId) +
+          row('telemetry.sqmId', fp.sqmId) +
+          row('MachineGuid', fp.machineGuid);
+        if (metaTimeEl) metaTimeEl.textContent = '读取于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      }
+      if (driverMeta) driverMeta.addEventListener('click', function (e) {
+        var t = e.target;
+        if (!t || !t.classList || !t.classList.contains('fc-copy')) return;
+        var v = t.getAttribute('data-fc-copy');
+        if (!v) return;
+        vscodeApi.postMessage({ command: 'fcCopyTicket', ticket: v });
+      });
+      if (metaCopyAllBtn) metaCopyAllBtn.addEventListener('click', function () {
+        if (!lastFpInfo) return;
+        var fp = lastFpInfo.fp || {};
+        var lines = [
+          'host: ' + (lastFpInfo.host || ''),
+          'ipv4: ' + (Array.isArray(lastFpInfo.ips) ? lastFpInfo.ips.join(', ') : ''),
+          'platform: ' + (lastFpInfo.platform || ''),
+          'machineId: ' + (fp.machineId || ''),
+          'devDeviceId: ' + (fp.devDeviceId || ''),
+          'telemetry.machineId: ' + (fp.telemetryMachineId || ''),
+          'telemetry.macMachineId: ' + (fp.macMachineId || ''),
+          'telemetry.sqmId: ' + (fp.sqmId || ''),
+          'MachineGuid: ' + (fp.machineGuid || '')
+        ];
+        vscodeApi.postMessage({ command: 'fcCopyTicket', ticket: lines.join('\\n') });
+      });
+      function requestInfo() {
+        if (metaTimeEl) metaTimeEl.textContent = '读取中…';
+        vscodeApi.postMessage({ command: 'fcGetInfo' });
+      }
+      requestInfo();
+      if (metaRefreshBtn) metaRefreshBtn.addEventListener('click', requestInfo);
+
+      if (genBtn) genBtn.addEventListener('click', function () {
+        genBtn.disabled = true;
+        fcFeedback('pending', '正在生成车票…');
+        vscodeApi.postMessage({ command: 'fcCreateTicket' });
+      });
+      if (copyBtn) copyBtn.addEventListener('click', function () {
+        var v = ticketOut.value.trim();
+        if (!v) return;
+        vscodeApi.postMessage({ command: 'fcCopyTicket', ticket: v });
+      });
+      if (applyBtn) applyBtn.addEventListener('click', function () {
+        var v = ticketIn.value.trim();
+        if (!v) { fcFeedback('error', '请先粘贴密钥或车票'); return; }
+        applyBtn.disabled = true;
+        if (/^sk-[A-Za-z0-9]{17}$/.test(v)) {
+          fcFeedback('pending', '正在向云端领取指纹…');
+          vscodeApi.postMessage({ command: 'fcCloudPickup', key: v });
+        } else if (v.indexOf('FCT1.') === 0) {
+          fcFeedback('pending', '正在覆盖本机 Cursor 指纹…');
+          vscodeApi.postMessage({ command: 'fcApplyTicket', ticket: v });
+        } else {
+          applyBtn.disabled = false;
+          fcFeedback('error', '无法识别：应为 sk- 开头 20 位密钥 或 FCT1. 开头的长车票');
+        }
+      });
+
+      function formatRemain(ms) {
+        if (ms <= 0) return '已过期';
+        var s = Math.ceil(ms / 1000);
+        var m = Math.floor(s / 60);
+        var r = s % 60;
+        return '剩余 ' + (m > 0 ? m + ' 分 ' : '') + r + ' 秒';
+      }
+      function tickKeyExpires() {
+        if (!keyExpiresAt || !keyExpiresEl) return;
+        var remain = keyExpiresAt - Date.now();
+        keyExpiresEl.textContent = formatRemain(remain);
+        keyExpiresEl.classList.toggle('expired', remain <= 0);
+        if (remain <= 0 && keyTimer) { clearInterval(keyTimer); keyTimer = null; }
+      }
+      if (cloudPubBtn) cloudPubBtn.addEventListener('click', function () {
+        cloudPubBtn.disabled = true;
+        var ttlMs = getSelectedTtlMs();
+        fcFeedback('pending', '正在向云端发布指纹（有效期 ' + Math.round(ttlMs / 60000) + ' 分钟）…');
+        vscodeApi.postMessage({ command: 'fcCloudPublish', ttlMs: ttlMs });
+      });
+      if (keyCopyBtn) keyCopyBtn.addEventListener('click', function () {
+        var v = keyValueEl ? keyValueEl.textContent : '';
+        if (!v) return;
+        vscodeApi.postMessage({ command: 'fcCopyTicket', ticket: v });
+      });
+      function openBackup() { vscodeApi.postMessage({ command: 'fcOpenBackupDir' }); }
+      if (openBackupBtn) openBackupBtn.addEventListener('click', openBackup);
+      if (openBackupBtn2) openBackupBtn2.addEventListener('click', openBackup);
+
+      window.addEventListener('message', function (event) {
+        var msg = event.data;
+        if (!msg || !msg.command) return;
+        switch (msg.command) {
+          case 'fcInfo':
+            renderDriverMeta(msg);
+            if (ttlSelect && msg.defaultTtlMs) {
+              var d = String(msg.defaultTtlMs);
+              var hit = Array.prototype.some.call(ttlSelect.options, function (o) { return o.value === d; });
+              if (hit) {
+                ttlSelect.value = d;
+                if (ttlCustom) ttlCustom.style.display = 'none';
+              } else {
+                ttlSelect.value = 'custom';
+                if (ttlCustom) {
+                  ttlCustom.style.display = '';
+                  ttlCustom.value = String(Math.max(1, Math.round(msg.defaultTtlMs / 60000)));
+                }
+              }
+            }
+            break;
+          case 'fcTicketResult':
+            genBtn.disabled = false;
+            if (msg.ok) {
+              ticketOut.value = msg.ticket || '';
+              copyBtn.disabled = !ticketOut.value;
+              renderDriverMeta({ fp: msg.fp, ips: msg.ips, host: msg.host, platform: (msg.platform || '') });
+              fcFeedback('success', '车票已生成，点「复制车票」发给乘客即可');
+            } else {
+              fcFeedback('error', msg.msg || '生成失败');
+            }
+            break;
+          case 'fcApplyResult':
+            applyBtn.disabled = false;
+            if (msg.ok) {
+              fcFeedback('success', msg.msg || '已上车');
+              addMessage('system', '已上车：' + (Array.isArray(msg.touched) ? msg.touched.join('、') : '') + (msg.backupDir ? '\\n备份：' + msg.backupDir : ''));
+            } else {
+              fcFeedback('error', msg.msg || '上车失败');
+            }
+            break;
+          case 'fcCloudPublishResult':
+            cloudPubBtn.disabled = false;
+            if (msg.ok) {
+              if (keyValueEl) keyValueEl.textContent = msg.key || '';
+              if (keyBox) keyBox.style.display = '';
+              keyExpiresAt = +msg.expiresAt || 0;
+              if (keyTimer) clearInterval(keyTimer);
+              tickKeyExpires();
+              keyTimer = setInterval(tickKeyExpires, 1000);
+              fcFeedback('success', '云端发车成功：把上方 sk- 密钥发给乘客即可（一次性领取）');
+            } else {
+              if (keyBox) keyBox.style.display = 'none';
+              fcFeedback('error', msg.msg || '云端发车失败');
+            }
+            break;
+          case 'fcClipboardResult':
+            if (msg.ok) fcFeedback('success', '已复制到剪贴板');
+            break;
+        }
+      });
+    })();
   </script>
 </body>
 </html>`;

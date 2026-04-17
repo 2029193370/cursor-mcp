@@ -1,0 +1,14 @@
+{
+  "name": "cursor-mcp-fache-server",
+  "version": "1.0.0",
+  "description": "Minimal HTTP server for cursor-mcp 发车 (publish/pickup) short-key exchange.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "MIT"
+}
