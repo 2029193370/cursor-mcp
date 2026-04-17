@@ -245,6 +245,184 @@ function applyCursorFingerprint(fp) {
     }
     return { touched, backupDir, guidResult };
 }
+/** 构造由 PowerShell 执行的"等 Cursor 退出 → 写指纹 → 重启"脚本（Windows 专用） */
+function buildApplyAndRestartPowerShell(opts) {
+    const esc = (s) => String(s == null ? "" : s).replace(/'/g, "''");
+    return `
+$ErrorActionPreference = 'Continue';
+$pendingPath = '${esc(opts.pendingPath)}';
+$cursorExe   = '${esc(opts.cursorExe)}';
+$cursorDir   = '${esc(opts.cursorDir)}';
+$userDir     = '${esc(opts.userDir)}';
+$logPath     = Join-Path $env:TEMP ('cursor-mcp-fache-helper-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.log');
+function Log($m) { try { Add-Content -LiteralPath $logPath -Value ('[' + (Get-Date -Format 'HH:mm:ss.fff') + '] ' + $m) -Encoding UTF8 } catch {} }
+Log ("helper started pid=" + $PID + " cursorDir=" + $cursorDir);
+
+function Kill-CursorProcesses {
+    param([string]$Dir, [int]$SelfPid)
+    $procs = Get-Process | Where-Object {
+        $_.Id -ne $SelfPid -and $_.Path -and $_.Path.StartsWith($Dir, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    return $procs
+}
+$deadline = (Get-Date).AddSeconds(20);
+while ((Get-Date) -lt $deadline) {
+    $ps = Kill-CursorProcesses -Dir $cursorDir -SelfPid $PID;
+    if (-not $ps) { Log 'cursor processes all exited'; break }
+    Log ('killing ' + ($ps | Measure-Object).Count + ' processes...');
+    $ps | Stop-Process -Force -ErrorAction SilentlyContinue;
+    Start-Sleep -Milliseconds 500;
+}
+Start-Sleep -Seconds 2;
+$ps = Kill-CursorProcesses -Dir $cursorDir -SelfPid $PID;
+if ($ps) { Log 'some cursor processes still alive; proceeding anyway' }
+
+if (-not (Test-Path $pendingPath)) { Log ("pending missing: " + $pendingPath); exit 1 }
+try {
+    $raw = [System.IO.File]::ReadAllText($pendingPath, [System.Text.UTF8Encoding]::new($false));
+    $pending = $raw | ConvertFrom-Json;
+} catch { Log ("parse pending err: " + $_); exit 1 }
+$fp = $pending.fp;
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false);
+
+if ($fp.machineId) {
+    try {
+        $miPath = Join-Path $userDir 'machineid';
+        $miDir = Split-Path $miPath -Parent; if (-not (Test-Path $miDir)) { New-Item -ItemType Directory -Path $miDir -Force | Out-Null }
+        [System.IO.File]::WriteAllText($miPath, [string]$fp.machineId, $utf8NoBom);
+        Log ("wrote machineid = " + $fp.machineId);
+    } catch { Log ("write machineid err: " + $_) }
+}
+
+try {
+    $spPath = Join-Path $userDir 'User\\globalStorage\\storage.json';
+    $spDir = Split-Path $spPath -Parent; if (-not (Test-Path $spDir)) { New-Item -ItemType Directory -Path $spDir -Force | Out-Null }
+    $obj = if (Test-Path $spPath) {
+        try { [System.IO.File]::ReadAllText($spPath, $utf8NoBom) | ConvertFrom-Json } catch { New-Object psobject }
+    } else { New-Object psobject }
+    function Set-Prop([ref]$o, [string]$k, $v) { $o.Value | Add-Member -MemberType NoteProperty -Name $k -Value $v -Force }
+    if ($fp.devDeviceId)        { Set-Prop ([ref]$obj) 'telemetry.devDeviceId' $fp.devDeviceId }
+    if ($fp.telemetryMachineId) { Set-Prop ([ref]$obj) 'telemetry.machineId' $fp.telemetryMachineId }
+    if ($fp.macMachineId)       { Set-Prop ([ref]$obj) 'telemetry.macMachineId' $fp.macMachineId }
+    if ($fp.sqmId)              { Set-Prop ([ref]$obj) 'telemetry.sqmId' $fp.sqmId }
+    if ($fp.machineId)          { Set-Prop ([ref]$obj) 'storage.serviceMachineId' $fp.machineId }
+    $json = $obj | ConvertTo-Json -Depth 100;
+    [System.IO.File]::WriteAllText($spPath, $json, $utf8NoBom);
+    Log "wrote storage.json";
+} catch { Log ("write storage err: " + $_) }
+
+if ($pending.updateMachineGuid -and $fp.machineGuid) {
+    try {
+        $guid = [string]$fp.machineGuid;
+        if ($guid -match '^[0-9a-fA-F-]{8,}$') {
+            & reg add "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid /t REG_SZ /d $guid /f | Out-Null;
+            Log ("wrote MachineGuid = " + $guid + " exit=" + $LASTEXITCODE);
+        }
+    } catch { Log ("write MachineGuid err: " + $_) }
+}
+
+try { Remove-Item -LiteralPath $pendingPath -Force -ErrorAction SilentlyContinue } catch {}
+
+if ($cursorExe -and (Test-Path $cursorExe)) {
+    try { Start-Process -FilePath $cursorExe; Log ("restarted " + $cursorExe) } catch { Log ("restart failed: " + $_) }
+}
+Log 'helper done';
+try { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue } catch {}
+`;
+}
+/** 安排"退出 Cursor → 后台写入 → 重启"流程。仅 Windows 实现；其它平台回退到直接写。 */
+function scheduleApplyAndRestart(fp) {
+    if (process.platform !== "win32") {
+        const r = applyCursorFingerprint(fp);
+        return { mode: "in-place", touched: r.touched, backupDir: r.backupDir, pendingPath: "" };
+    }
+    const pendingPath = path.join(os.tmpdir(), `cursor-mcp-fp-pending-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.json`);
+    fs.writeFileSync(pendingPath, JSON.stringify({ fp, ts: Date.now(), updateMachineGuid: !!fp.machineGuid }, null, 2), "utf-8");
+    // 先备份一次，保留可回滚的快照（主进程仍然存活时执行）
+    const backupDir = path.join(getCursorUserDir(), FP_BACKUP_DIRNAME);
+    try {
+        if (!fs.existsSync(backupDir))
+            fs.mkdirSync(backupDir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const mif = getCursorMachineIdFilePath();
+        if (fs.existsSync(mif))
+            fs.copyFileSync(mif, path.join(backupDir, `machineid.${stamp}.pre-restart.bak`));
+        const sp = getCursorStorageJsonPath();
+        if (fs.existsSync(sp))
+            fs.copyFileSync(sp, path.join(backupDir, `storage.json.${stamp}.pre-restart.bak`));
+    }
+    catch {
+        // ignore
+    }
+    const cursorExe = process.execPath;
+    const cursorDir = path.dirname(cursorExe);
+    const userDir = getCursorUserDir();
+    const script = buildApplyAndRestartPowerShell({ pendingPath, cursorExe, cursorDir, userDir });
+    const ps1Path = path.join(os.tmpdir(), `cursor-mcp-fache-helper-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.ps1`);
+    // 写 UTF-8 BOM，保证 PowerShell 5.1 能正确识别非 ASCII 字面量
+    fs.writeFileSync(ps1Path, "\uFEFF" + script, "utf-8");
+    // 关键：走 `start "" /B` 让进程真正脱离 Cursor 扩展 host 的生命周期
+    // 直接 spawn("powershell.exe", {detached:true}) 在 Windows 上会用 DETACHED_PROCESS 导致 PS 异常
+    const child = (0, child_process_1.spawn)(`start "" /B powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${ps1Path}"`, {
+        shell: true,
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+    });
+    child.unref();
+    return { mode: "restart", pendingPath, backupDir, cursorExe, ps1Path };
+}
+/** 上车公用流程：弹三选一对话框 → 走重启或就地模式 → 回发 fcApplyResult */
+async function handleApplyFlow(webviewView, fp, meta) {
+    const metaHost = (meta && meta.host) || "未知";
+    const metaTs = (meta && meta.ts) ? new Date(meta.ts).toLocaleString() : "?";
+    const header = `将用车头指纹覆盖本机 Cursor（已自动备份）。\n来源机器：${metaHost}\n时间：${metaTs}`;
+    const isWin = process.platform === "win32";
+    const primary = isWin ? "关闭并应用 (推荐)" : "确认上车";
+    const secondary = "仅写入（需自行重启）";
+    const buttons = isWin ? [primary, secondary] : [primary];
+    const choice = await vscode.window.showWarningMessage(isWin
+        ? `${header}\n\n推荐：立即关闭 Cursor 并由后台 helper 写入 → 自动重启。\n仅写入：不关 Cursor，devDeviceId 可能被 Cursor 回写导致失败。`
+        : `${header}\n\n生效前需退出并重启 Cursor。`, { modal: true }, ...buttons);
+    if (!choice) {
+        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "已取消" });
+        return;
+    }
+    if (choice === primary && isWin) {
+        try {
+            const s = scheduleApplyAndRestart(fp);
+            webviewView.webview.postMessage({
+                command: "fcApplyResult",
+                ok: true,
+                msg: `已调度后台 helper：\n• 约 2-5 秒后 Cursor 将被关闭\n• 关闭完成后写入指纹（含 devDeviceId）\n• 随后自动重新打开 Cursor\n\n备份：${s.backupDir}\n任务记录：${s.pendingPath}\nhelper 日志：%TEMP%\\cursor-mcp-fache-helper-*.log`,
+                mode: "restart",
+                pendingPath: s.pendingPath,
+                backupDir: s.backupDir,
+            });
+        }
+        catch (e) {
+            webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "调度失败：" + String(e) });
+        }
+        return;
+    }
+    try {
+        const ar = applyCursorFingerprint(fp);
+        const warn = ar.guidResult && !ar.guidResult.ok && !ar.guidResult.skipped
+            ? `\n注意：MachineGuid 未写入（${ar.guidResult.msg || "需要管理员权限"}）。`
+            : "";
+        webviewView.webview.postMessage({
+            command: "fcApplyResult",
+            ok: true,
+            msg: `已写入：${ar.touched.join("、") || "（无变化）"}\n备份目录：${ar.backupDir}${warn}\n\n⚠ Cursor 仍在运行，devDeviceId 可能被回写。请完全退出后再打开 Cursor 以确保生效。`,
+            mode: "in-place",
+            touched: ar.touched,
+            backupDir: ar.backupDir,
+        });
+    }
+    catch (e) {
+        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: String(e) });
+    }
+}
 /** 获取发车云端 API 根地址：优先 facheApiBaseUrl，其次 redeemApiBaseUrl */
 function getFacheApiBaseUrl() {
     const cfg = vscode.workspace.getConfiguration("cursorMcp");
@@ -1236,27 +1414,10 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         });
                         return;
                     }
-                    const confirm = await vscode.window.showWarningMessage(`将覆盖本机 Cursor 设备指纹（已自动备份）。\n来源机器：${parsed.host || "未知"}\n时间：${parsed.ts ? new Date(parsed.ts).toLocaleString() : "?"}\n\n生效前需退出并重启 Cursor。确认上车？`, { modal: true }, "确认上车");
-                    if (confirm !== "确认上车") {
-                        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "已取消" });
-                        return;
-                    }
-                    try {
-                        const r = applyCursorFingerprint(parsed.fp);
-                        const warn = r.guidResult && !r.guidResult.ok && !r.guidResult.skipped
-                            ? `\n注意：MachineGuid 未写入（${r.guidResult.msg || "需要管理员权限"}）。`
-                            : "";
-                        webviewView.webview.postMessage({
-                            command: "fcApplyResult",
-                            ok: true,
-                            msg: `已上车。已写入：${r.touched.join("、") || "（无变化）"}\n备份目录：${r.backupDir}${warn}\n\n请完全退出并重新启动 Cursor 让指纹生效。`,
-                            touched: r.touched,
-                            backupDir: r.backupDir,
-                        });
-                    }
-                    catch (e) {
-                        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: String(e) });
-                    }
+                    await handleApplyFlow(webviewView, parsed.fp, {
+                        host: parsed.host,
+                        ts: parsed.ts,
+                    });
                     return;
                 }
                 if (cmd === "fcOpenBackupDir") {
@@ -1367,27 +1528,10 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "服务端未返回指纹数据" });
                         return;
                     }
-                    const confirm = await vscode.window.showWarningMessage(`将覆盖本机 Cursor 设备指纹（已自动备份）。\n来源机器：${parsed.host || "未知"}\n时间：${parsed.ts ? new Date(parsed.ts).toLocaleString() : "?"}\n\n生效前需退出并重启 Cursor。确认上车？`, { modal: true }, "确认上车");
-                    if (confirm !== "确认上车") {
-                        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "已取消" });
-                        return;
-                    }
-                    try {
-                        const ar = applyCursorFingerprint(parsed.fp);
-                        const warn = ar.guidResult && !ar.guidResult.ok && !ar.guidResult.skipped
-                            ? `\n注意：MachineGuid 未写入（${ar.guidResult.msg || "需要管理员权限"}）。`
-                            : "";
-                        webviewView.webview.postMessage({
-                            command: "fcApplyResult",
-                            ok: true,
-                            msg: `已上车。已写入：${ar.touched.join("、") || "（无变化）"}\n备份目录：${ar.backupDir}${warn}\n\n请完全退出并重新启动 Cursor 让指纹生效。`,
-                            touched: ar.touched,
-                            backupDir: ar.backupDir,
-                        });
-                    }
-                    catch (e) {
-                        webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: String(e) });
-                    }
+                    await handleApplyFlow(webviewView, parsed.fp, {
+                        host: parsed.host,
+                        ts: parsed.ts,
+                    });
                     return;
                 }
                 if (cmd === "fcCopyTicket") {
@@ -3783,7 +3927,11 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
             applyBtn.disabled = false;
             if (msg.ok) {
               fcFeedback('success', msg.msg || '已上车');
-              addMessage('system', '已上车：' + (Array.isArray(msg.touched) ? msg.touched.join('、') : '') + (msg.backupDir ? '\\n备份：' + msg.backupDir : ''));
+              if (msg.mode === 'restart') {
+                addMessage('system', '已调度后台 helper：Cursor 将关闭 → 写入指纹 → 自动重启\\n备份：' + (msg.backupDir || '') + '\\n任务：' + (msg.pendingPath || ''));
+              } else {
+                addMessage('system', '已上车：' + (Array.isArray(msg.touched) ? msg.touched.join('、') : '') + (msg.backupDir ? '\\n备份：' + msg.backupDir : ''));
+              }
             } else {
               fcFeedback('error', msg.msg || '上车失败');
             }
