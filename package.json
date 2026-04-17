@@ -1,0 +1,132 @@
+{
+	"name": "cursor-mcp",
+	"displayName": "Cursor MCP",
+	"description": "Cursor 侧栏多路 MCP 扩展：支持多项目与多工作区并行、多窗口独立通道；消息随附截图/文件、会话备忘等能力。",
+	"version": "1.0.0",
+	"publisher": "litingfeng",
+	"author": {
+		"name": "litingfeng",
+		"email": "2029193370@qq.com"
+	},
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/2029193370/cursor-mcp.git"
+	},
+	"homepage": "https://github.com/2029193370/cursor-mcp#readme",
+	"bugs": {
+		"url": "https://github.com/2029193370/cursor-mcp/issues"
+	},
+	"keywords": [
+		"mcp",
+		"cursor",
+		"model context protocol",
+		"multi-session",
+		"sidebar",
+		"chat",
+		"check_messages"
+	],
+	"categories": [
+		"Other"
+	],
+	"engines": {
+		"vscode": "^1.71.0"
+	},
+	"main": "./dist/extension.js",
+	"activationEvents": [
+		"onView:cursorMcp.sidebar",
+		"onCommand:cursorMcp.configureWorkspace",
+		"onCommand:cursorMcp.generateLicenseKey",
+		"onCommand:cursorMcp.clearLicense"
+	],
+	"contributes": {
+		"commands": [
+			{
+				"command": "cursorMcp.configureWorkspace",
+				"title": "配置工作区（MCP）",
+				"category": "Cursor MCP"
+			},
+			{
+				"command": "cursorMcp.generateLicenseKey",
+				"title": "生成卡密（管理员）",
+				"category": "Cursor MCP"
+			},
+			{
+				"command": "cursorMcp.clearLicense",
+				"title": "清除本机激活（管理员）",
+				"category": "Cursor MCP"
+			}
+		],
+		"configuration": {
+			"title": "Cursor MCP",
+			"properties": {
+				"cursorMcp.licenseSecret": {
+					"type": "string",
+					"default": "",
+					"description": "卡密 HMAC 签名密钥。发卡与验证须使用同一密钥（建议≥8字符）。"
+				},
+				"cursorMcp.adminPassword": {
+					"type": "string",
+					"default": "",
+					"description": "若填写，则「生成卡密」「清除激活」前需输入此密码。"
+				},
+				"cursorMcp.redeemApiBaseUrl": {
+					"type": "string",
+					"default": "",
+					"description": "云端卡密核销 API 根地址（无尾部斜杠）。非 CMC1. 开头的卡密激活时会 POST 到此地址的 /api/redeem。"
+				},
+				"cursorMcp.payStoreUrl": {
+					"type": "string",
+					"default": "",
+					"description": "侧栏激活页「在线购买」跳转的支付页完整 URL（浏览器打开）。"
+				},
+				"cursorMcp.redeemTimeoutMs": {
+					"type": "number",
+					"default": 20000,
+					"description": "云端核销请求超时（毫秒），范围 3000–120000。"
+				},
+				"cursorMcp.cloudLicenseOnly": {
+					"type": "boolean",
+					"default": false,
+					"description": "为 true 时仅允许云端卡密（走 redeemApiBaseUrl），拒绝 CMC1. 本地卡密。默认 false：云端卡密与 CMC1 本地 HMAC 卡密均可使用。"
+				},
+				"cursorMcp.cloudLicenseVerifyIntervalMs": {
+					"type": "number",
+					"default": 900000,
+					"description": "云端卡密吊销校验间隔（毫秒）：定期请求 /api/license/verify；范围 60000–86400000，默认 15 分钟。"
+				}
+			}
+		},
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "cursor-mcp",
+					"title": "Cursor MCP",
+					"icon": "resources/icon.svg"
+				}
+			]
+		},
+		"views": {
+			"cursor-mcp": [
+				{
+					"type": "webview",
+					"id": "cursorMcp.sidebar",
+					"name": "Cursor MCP"
+				}
+			]
+		}
+	},
+	"scripts": {
+		"compile": "tsc -p .",
+		"watch": "tsc -p . -w",
+		"package": "vsce package --no-dependencies",
+		"postinstall": "cd mcp-server && npm install"
+	},
+	"devDependencies": {
+		"@types/node": "^16.18.0",
+		"@types/vscode": "^1.71.0",
+		"ts-node": "^10.9.2",
+		"typescript": "^4.7.4",
+		"@vscode/vsce": "^3.7.0"
+	}
+}
