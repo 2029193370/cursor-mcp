@@ -25,28 +25,41 @@ if (process.platform !== "win32") {
 
 function buildApplyAndRestartPowerShell(opts) {
     const esc = (s) => String(s == null ? "" : s).replace(/'/g, "''");
+    const candidatesPs = "@(" + (opts.candidates || []).map((c) => `'${esc(c)}'`).join(",") + ")";
+    const killDirsPs = "@(" + (opts.killDirs || []).map((c) => `'${esc(c)}'`).join(",") + ")";
     return `
 $ErrorActionPreference = 'Continue';
 $pendingPath = '${esc(opts.pendingPath)}';
-$cursorExe   = '${esc(opts.cursorExe)}';
-$cursorDir   = '${esc(opts.cursorDir)}';
 $userDir     = '${esc(opts.userDir)}';
+$candidates  = ${candidatesPs};
+$killDirs    = ${killDirsPs};
 $logPath     = Join-Path $env:TEMP ('cursor-mcp-fache-helper-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.log');
 function Log($m) { try { Add-Content -LiteralPath $logPath -Value ('[' + (Get-Date -Format 'HH:mm:ss.fff') + '] ' + $m) -Encoding UTF8 } catch {} }
-Log ("helper started pid=" + $PID + " cursorDir=" + $cursorDir);
+Log ("helper started pid=" + $PID + " candidates=" + ($candidates -join '; '));
 
-function Kill-CursorProcesses {
-    param([string]$Dir, [int]$SelfPid)
-    $procs = Get-Process | Where-Object {
-        $_.Id -ne $SelfPid -and $_.Path -and $_.Path.StartsWith($Dir, [System.StringComparison]::OrdinalIgnoreCase)
+function Get-CursorProcesses {
+    param([int]$SelfPid)
+    $procs = Get-Process -Name 'Cursor' -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $SelfPid }
+    if (-not $killDirs -or $killDirs.Count -eq 0) { return $procs }
+    return $procs | Where-Object {
+        $path = $_.Path
+        if (-not $path) { return $false }
+        foreach ($d in $killDirs) {
+            if ($d -and $path.StartsWith($d, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+        return $false
     }
-    return $procs
 }
+try {
+    Get-CursorProcesses -SelfPid $PID | ForEach-Object {
+        try { $null = $_.CloseMainWindow() } catch {}
+    }
+} catch {}
 $deadline = (Get-Date).AddSeconds(20);
 while ((Get-Date) -lt $deadline) {
-    $ps = Kill-CursorProcesses -Dir $cursorDir -SelfPid $PID;
+    $ps = Get-CursorProcesses -SelfPid $PID;
     if (-not $ps) { Log 'cursor processes all exited'; break }
-    Log ('killing ' + ($ps | Measure-Object).Count + ' processes...');
+    Log ('force killing ' + ($ps | Measure-Object).Count + ' processes...');
     $ps | Stop-Process -Force -ErrorAction SilentlyContinue;
     Start-Sleep -Milliseconds 500;
 }
@@ -88,9 +101,27 @@ try {
 
 try { Remove-Item -LiteralPath $pendingPath -Force -ErrorAction SilentlyContinue } catch {}
 
-if ($cursorExe -and (Test-Path $cursorExe)) {
-    try { Start-Process -FilePath $cursorExe; Log ("restarted " + $cursorExe) } catch { Log ("restart failed: " + $_) }
+$launched = $false
+foreach ($exe in $candidates) {
+    if (-not $exe) { continue }
+    if (-not (Test-Path -LiteralPath $exe)) { Log ("candidate missing: " + $exe); continue }
+    try {
+        $wd = Split-Path -LiteralPath $exe -Parent
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe
+        $psi.WorkingDirectory = $wd
+        $psi.UseShellExecute = $true
+        $psi.WindowStyle = 'Normal'
+        $p = [System.Diagnostics.Process]::Start($psi) | Out-Null
+        Log ("restarted via ShellExecute: " + $exe)
+        $launched = $true
+        break
+    } catch { Log ("restart failed from " + $exe + ": " + $_) }
 }
+if (-not $launched) {
+    try { & cmd.exe /c "start cursor" 2>$null | Out-Null; Log "restart via 'start cursor' cmd" } catch {}
+}
+
 Log 'helper done';
 try { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue } catch {}
 `;
@@ -125,7 +156,12 @@ fs.mkdirSync(path.dirname(cursorExe), { recursive: true });
 fs.writeFileSync(cursorExe, "", "utf-8");
 const cursorDir = path.dirname(cursorExe);
 
-const script = buildApplyAndRestartPowerShell({ pendingPath, cursorExe, cursorDir, userDir });
+const script = buildApplyAndRestartPowerShell({
+    pendingPath,
+    userDir,
+    candidates: [cursorExe, path.join(tmpRoot, "nonexistent", "Cursor.exe")],
+    killDirs: [cursorDir],
+});
 const ps1Path = path.join(tmpRoot, "helper.ps1");
 fs.writeFileSync(ps1Path, "\uFEFF" + script, "utf-8");
 

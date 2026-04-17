@@ -245,36 +245,122 @@ function applyCursorFingerprint(fp) {
     }
     return { touched, backupDir, guidResult };
 }
-/** 构造由 PowerShell 执行的"等 Cursor 退出 → 写指纹 → 重启"脚本（Windows 专用） */
+/** 返回 Cursor.exe 的多路径候选（按可信度从高到低，自动去重，不做 fs.existsSync 过滤） */
+function getCursorExeCandidates() {
+    const list = [];
+    const push = (p) => {
+        if (typeof p !== "string")
+            return;
+        const t = p.trim();
+        if (!t)
+            return;
+        if (!list.some((x) => x.toLowerCase() === t.toLowerCase()))
+            list.push(t);
+    };
+    // 1. 用户自定义配置（最高优先）
+    try {
+        const cfg = vscode.workspace.getConfiguration("cursorMcp").get("cursorExePath");
+        if (typeof cfg === "string" && cfg.trim())
+            push(cfg.trim());
+    }
+    catch {
+        // ignore
+    }
+    // 2. 当前正在运行的 Cursor 进程可执行路径（最接近"真实"）
+    if (process.platform === "win32") {
+        try {
+            const r = (0, child_process_1.spawnSync)("powershell.exe", [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                "(Get-CimInstance Win32_Process -Filter \"Name='Cursor.exe'\" | Where-Object { $_.ExecutablePath } | Select-Object -First 1 ExecutablePath).ExecutablePath",
+            ], { encoding: "utf8", windowsHide: true, timeout: 5000 });
+            const p = (r.stdout || "").trim();
+            if (p)
+                push(p);
+        }
+        catch {
+            // ignore
+        }
+    }
+    // 3. 当前扩展 Host 进程的 execPath（通常就是 Cursor.exe）
+    if (process.execPath)
+        push(process.execPath);
+    // 4. 常见硬编码路径
+    if (process.platform === "win32") {
+        const lad = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+        const pf = process.env.ProgramFiles || "C:\\Program Files";
+        const pf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+        const defaults = [
+            path.join(lad, "Programs", "cursor", "Cursor.exe"),
+            path.join(lad, "Programs", "Cursor", "Cursor.exe"),
+            path.join(pf, "Cursor", "Cursor.exe"),
+            path.join(pf86, "Cursor", "Cursor.exe"),
+            "C:\\Cursor\\Cursor.exe",
+            "D:\\Cursor\\Cursor.exe",
+            "E:\\Cursor\\Cursor.exe",
+            "F:\\Cursor\\Cursor.exe",
+        ];
+        for (const p of defaults)
+            push(p);
+    }
+    return list;
+}
+/** 从候选里选第一个实际存在的，作为"当前可用"的 Cursor.exe 路径（可能返回空字符串） */
+function resolveCursorExe() {
+    for (const p of getCursorExeCandidates()) {
+        try {
+            if (fs.existsSync(p))
+                return p;
+        }
+        catch {
+            // ignore
+        }
+    }
+    return "";
+}
+/** 构造 helper PS1：等 Cursor 退出 → 写指纹 → 按 candidates 顺序重启（ShellExecute 模拟双击） */
 function buildApplyAndRestartPowerShell(opts) {
     const esc = (s) => String(s == null ? "" : s).replace(/'/g, "''");
+    const candidatesPs = "@(" + (opts.candidates || []).map((c) => `'${esc(c)}'`).join(",") + ")";
+    const killDirsPs = "@(" + (opts.killDirs || []).map((c) => `'${esc(c)}'`).join(",") + ")";
     return `
 $ErrorActionPreference = 'Continue';
 $pendingPath = '${esc(opts.pendingPath)}';
-$cursorExe   = '${esc(opts.cursorExe)}';
-$cursorDir   = '${esc(opts.cursorDir)}';
 $userDir     = '${esc(opts.userDir)}';
+$candidates  = ${candidatesPs};
+$killDirs    = ${killDirsPs};
 $logPath     = Join-Path $env:TEMP ('cursor-mcp-fache-helper-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.log');
 function Log($m) { try { Add-Content -LiteralPath $logPath -Value ('[' + (Get-Date -Format 'HH:mm:ss.fff') + '] ' + $m) -Encoding UTF8 } catch {} }
-Log ("helper started pid=" + $PID + " cursorDir=" + $cursorDir);
+Log ("helper started pid=" + $PID + " candidates=" + ($candidates -join '; '));
 
-function Kill-CursorProcesses {
-    param([string]$Dir, [int]$SelfPid)
-    $procs = Get-Process | Where-Object {
-        $_.Id -ne $SelfPid -and $_.Path -and $_.Path.StartsWith($Dir, [System.StringComparison]::OrdinalIgnoreCase)
+function Get-CursorProcesses {
+    param([int]$SelfPid)
+    $procs = Get-Process -Name 'Cursor' -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $SelfPid }
+    if (-not $killDirs -or $killDirs.Count -eq 0) { return $procs }
+    return $procs | Where-Object {
+        $path = $_.Path
+        if (-not $path) { return $false }
+        foreach ($d in $killDirs) {
+            if ($d -and $path.StartsWith($d, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+        return $false
     }
-    return $procs
 }
+# 模拟 auto-cursor："先 graceful，失败再 force kill"
+try {
+    Get-CursorProcesses -SelfPid $PID | ForEach-Object {
+        try { $null = $_.CloseMainWindow() } catch {}
+    }
+} catch {}
 $deadline = (Get-Date).AddSeconds(20);
 while ((Get-Date) -lt $deadline) {
-    $ps = Kill-CursorProcesses -Dir $cursorDir -SelfPid $PID;
+    $ps = Get-CursorProcesses -SelfPid $PID;
     if (-not $ps) { Log 'cursor processes all exited'; break }
-    Log ('killing ' + ($ps | Measure-Object).Count + ' processes...');
+    Log ('force killing ' + ($ps | Measure-Object).Count + ' processes...');
     $ps | Stop-Process -Force -ErrorAction SilentlyContinue;
     Start-Sleep -Milliseconds 500;
 }
 Start-Sleep -Seconds 2;
-$ps = Kill-CursorProcesses -Dir $cursorDir -SelfPid $PID;
+$ps = Get-CursorProcesses -SelfPid $PID;
 if ($ps) { Log 'some cursor processes still alive; proceeding anyway' }
 
 if (-not (Test-Path $pendingPath)) { Log ("pending missing: " + $pendingPath); exit 1 }
@@ -323,9 +409,33 @@ if ($pending.updateMachineGuid -and $fp.machineGuid) {
 
 try { Remove-Item -LiteralPath $pendingPath -Force -ErrorAction SilentlyContinue } catch {}
 
-if ($cursorExe -and (Test-Path $cursorExe)) {
-    try { Start-Process -FilePath $cursorExe; Log ("restarted " + $cursorExe) } catch { Log ("restart failed: " + $_) }
+# 启动 Cursor：按 candidates 顺序 ShellExecute（等价于双击）+ WorkingDirectory 指到 exe 目录，
+# 避免把 helper 的 cwd 当作 Cursor 启动目录。
+$launched = $false
+foreach ($exe in $candidates) {
+    if (-not $exe) { continue }
+    if (-not (Test-Path -LiteralPath $exe)) { Log ("candidate missing: " + $exe); continue }
+    try {
+        $wd = Split-Path -LiteralPath $exe -Parent
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe
+        $psi.WorkingDirectory = $wd
+        $psi.UseShellExecute = $true
+        $psi.WindowStyle = 'Normal'
+        $p = [System.Diagnostics.Process]::Start($psi) | Out-Null
+        Log ("restarted via ShellExecute: " + $exe)
+        $launched = $true
+        break
+    } catch { Log ("restart failed from " + $exe + ": " + $_) }
 }
+if (-not $launched) {
+    # 最后兜底：试 App Paths / where cursor / 快捷方式
+    try {
+        & cmd.exe /c "start cursor" 2>$null | Out-Null
+        Log "restart via 'start cursor' cmd"
+    } catch { Log ("final fallback 'start cursor' failed: " + $_) }
+}
+
 Log 'helper done';
 try { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue } catch {}
 `;
@@ -354,10 +464,12 @@ function scheduleApplyAndRestart(fp) {
     catch {
         // ignore
     }
-    const cursorExe = process.execPath;
-    const cursorDir = path.dirname(cursorExe);
+    const candidates = getCursorExeCandidates().filter((p) => { try { return fs.existsSync(p); } catch { return false; } });
+    // kill 范围：候选路径所在的目录（去重），避免误杀与 Cursor 同名但不同路径的进程
+    const killDirs = Array.from(new Set(candidates.map((p) => path.dirname(p))));
+    const cursorExe = candidates[0] || process.execPath;
     const userDir = getCursorUserDir();
-    const script = buildApplyAndRestartPowerShell({ pendingPath, cursorExe, cursorDir, userDir });
+    const script = buildApplyAndRestartPowerShell({ pendingPath, candidates, killDirs, userDir });
     const ps1Path = path.join(os.tmpdir(), `cursor-mcp-fache-helper-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.ps1`);
     // 写 UTF-8 BOM，保证 PowerShell 5.1 能正确识别非 ASCII 字面量
     fs.writeFileSync(ps1Path, "\uFEFF" + script, "utf-8");
@@ -370,7 +482,7 @@ function scheduleApplyAndRestart(fp) {
         windowsHide: true,
     });
     child.unref();
-    return { mode: "restart", pendingPath, backupDir, cursorExe, ps1Path };
+    return { mode: "restart", pendingPath, backupDir, cursorExe, candidates, ps1Path };
 }
 /** 上车公用流程：弹三选一对话框 → 走重启或就地模式 → 回发 fcApplyResult */
 async function handleApplyFlow(webviewView, fp, meta) {
@@ -391,13 +503,18 @@ async function handleApplyFlow(webviewView, fp, meta) {
     if (choice === primary && isWin) {
         try {
             const s = scheduleApplyAndRestart(fp);
+            const exeLines = (s.candidates && s.candidates.length)
+                ? s.candidates.map((p, i) => `  ${i + 1}. ${p}`).join("\n")
+                : "  （未识别到 Cursor 主程序，启动可能失败；请在设置中配置 cursorMcp.cursorExePath）";
             webviewView.webview.postMessage({
                 command: "fcApplyResult",
                 ok: true,
-                msg: `已调度后台 helper：\n• 约 2-5 秒后 Cursor 将被关闭\n• 关闭完成后写入指纹（含 devDeviceId）\n• 随后自动重新打开 Cursor\n\n备份：${s.backupDir}\n任务记录：${s.pendingPath}\nhelper 日志：%TEMP%\\cursor-mcp-fache-helper-*.log`,
+                msg: `已调度后台 helper：\n• 约 2-5 秒后 Cursor 将被关闭\n• 关闭完成后写入指纹（含 devDeviceId）\n• 随后自动重新打开 Cursor\n\n重启候选路径（按顺序尝试）：\n${exeLines}\n\n备份：${s.backupDir}\n任务记录：${s.pendingPath}\nhelper 日志：%TEMP%\\cursor-mcp-fache-helper-*.log`,
                 mode: "restart",
                 pendingPath: s.pendingPath,
                 backupDir: s.backupDir,
+                cursorExe: s.cursorExe,
+                candidates: s.candidates || [],
             });
         }
         catch (e) {
@@ -1435,6 +1552,12 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                 if (cmd === "fcGetInfo") {
                     const fp = readCursorFingerprint();
                     const ips = getLocalIps();
+                    const cursorExe = resolveCursorExe();
+                    const cursorCandidates = getCursorExeCandidates().map((p) => {
+                        let exists = false;
+                        try { exists = fs.existsSync(p); } catch { exists = false; }
+                        return { path: p, exists };
+                    });
                     webviewView.webview.postMessage({
                         command: "fcInfo",
                         fp,
@@ -1443,6 +1566,8 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         userDir: getCursorUserDir(),
                         platform: process.platform,
                         defaultTtlMs: getFacheTicketTtlMs(),
+                        cursorExe,
+                        cursorCandidates,
                     });
                     return;
                 }
@@ -3902,10 +4027,14 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
         lastFpInfo = info;
         var fp = info.fp || {};
         var ips = Array.isArray(info.ips) ? info.ips.join(', ') : '';
+        var cursorLine = info.cursorExe
+          ? row('Cursor 可执行', info.cursorExe)
+          : '<div class="fc-row"><span class="fc-key">Cursor 可执行</span><span class="fc-val fc-empty">未识别（可在设置 cursorMcp.cursorExePath 指定）</span><button type="button" class="fc-copy" disabled>复制</button></div>';
         driverMeta.innerHTML =
           row('主机名', info.host || '') +
           row('IPv4', ips) +
           row('平台', info.platform || '') +
+          cursorLine +
           row('machineId', fp.machineId) +
           row('devDeviceId', fp.devDeviceId) +
           row('telemetry.machineId', fp.telemetryMachineId) +
@@ -3928,6 +4057,7 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
           'host: ' + (lastFpInfo.host || ''),
           'ipv4: ' + (Array.isArray(lastFpInfo.ips) ? lastFpInfo.ips.join(', ') : ''),
           'platform: ' + (lastFpInfo.platform || ''),
+          'cursorExe: ' + (lastFpInfo.cursorExe || ''),
           'machineId: ' + (fp.machineId || ''),
           'devDeviceId: ' + (fp.devDeviceId || ''),
           'telemetry.machineId: ' + (fp.telemetryMachineId || ''),
