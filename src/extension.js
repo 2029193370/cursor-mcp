@@ -539,7 +539,7 @@ function httpGetJson(url) {
             u = new URL(url);
         }
         catch {
-            resolve({ ok: false });
+            resolve({ ok: false, status: 0, err: "bad_url" });
             return;
         }
         const mod = u.protocol === "https:" ? https : http;
@@ -556,15 +556,18 @@ function httpGetJson(url) {
             res.on("data", (c) => chunks.push(Buffer.from(c)));
             res.on("end", () => {
                 const text = Buffer.concat(chunks).toString("utf-8");
+                const status = res.statusCode || 0;
+                let json = null;
                 try {
-                    resolve({ ok: (res.statusCode || 0) < 400, status: res.statusCode || 0, json: text ? JSON.parse(text) : null });
+                    json = text ? JSON.parse(text) : null;
                 }
                 catch {
-                    resolve({ ok: false, status: res.statusCode || 0 });
+                    // ignore parse err
                 }
+                resolve({ ok: status < 400, status, json, headers: res.headers || {} });
             });
         });
-        req.on("error", () => resolve({ ok: false }));
+        req.on("error", (e) => resolve({ ok: false, status: 0, err: String((e && e.message) || e) }));
         req.setTimeout(15000, () => {
             try {
                 req.destroy(new Error("timeout"));
@@ -575,24 +578,90 @@ function httpGetJson(url) {
         });
     });
 }
+/** 从 feedUrl（通常是 GitHub API）推出对应的 Release HTML 页，供降级打开 */
+function deriveReleasesHtmlUrl(feedUrl) {
+    try {
+        const u = new URL(feedUrl);
+        if (u.hostname === "api.github.com") {
+            const m = /^\/repos\/([^/]+)\/([^/]+)\/releases/.exec(u.pathname);
+            if (m)
+                return `https://github.com/${m[1]}/${m[2]}/releases/latest`;
+        }
+        return feedUrl;
+    }
+    catch {
+        return feedUrl;
+    }
+}
 async function fetchLatestReleaseInfo() {
-    const r = await httpGetJson(getUpdateFeedUrl());
-    if (!r.ok || !r.json || typeof r.json !== "object")
-        return null;
+    const feedUrl = getUpdateFeedUrl();
+    const derivedHtmlUrl = deriveReleasesHtmlUrl(feedUrl);
+    const r = await httpGetJson(feedUrl);
+    if (!r.ok) {
+        const h = r.headers || {};
+        const remaining = Number(h["x-ratelimit-remaining"]);
+        const reset = Number(h["x-ratelimit-reset"]);
+        let reason = "network";
+        if (r.status === 403 && Number.isFinite(remaining) && remaining === 0)
+            reason = "rate_limit";
+        else if (r.status === 403)
+            reason = "forbidden";
+        else if (r.status === 404)
+            reason = "not_found";
+        else if (r.status >= 500)
+            reason = "server_error";
+        else if (r.status > 0)
+            reason = "http_error";
+        else if (r.err === "bad_url")
+            reason = "bad_url";
+        return {
+            ok: false,
+            reason,
+            status: r.status || 0,
+            message: (r.json && typeof r.json.message === "string" ? r.json.message : r.err) || "",
+            resetAt: Number.isFinite(reset) && reset > 0 ? reset * 1000 : 0,
+            htmlUrl: derivedHtmlUrl,
+        };
+    }
     const obj = r.json;
+    if (!obj || typeof obj !== "object")
+        return { ok: false, reason: "invalid", status: r.status || 0, message: "", resetAt: 0, htmlUrl: derivedHtmlUrl };
     const tag = String(obj.tag_name || "").replace(/^v/, "");
     if (!tag)
-        return null;
+        return { ok: false, reason: "invalid", status: r.status || 0, message: "", resetAt: 0, htmlUrl: derivedHtmlUrl };
     const assets = Array.isArray(obj.assets) ? obj.assets : [];
     const vsix = assets.find((a) => a && typeof a.browser_download_url === "string" && /\.vsix$/i.test(String(a.name || "")));
     return {
+        ok: true,
         version: tag,
-        htmlUrl: typeof obj.html_url === "string" ? obj.html_url : "",
+        htmlUrl: typeof obj.html_url === "string" ? obj.html_url : derivedHtmlUrl,
         vsixUrl: vsix ? String(vsix.browser_download_url) : "",
         vsixName: vsix ? String(vsix.name || "") : "",
         notes: typeof obj.body === "string" ? obj.body.slice(0, 4000) : "",
         publishedAt: typeof obj.published_at === "string" ? obj.published_at : "",
     };
+}
+/** 把 failReason 转成简短中文提示 */
+function updateFailHint(info) {
+    if (!info)
+        return "未知错误";
+    if (info.reason === "rate_limit") {
+        const when = info.resetAt ? "，" + new Date(info.resetAt).toLocaleTimeString() + " 后恢复" : "";
+        return "GitHub API 限流（每小时 60 次/IP）" + when;
+    }
+    if (info.reason === "network")
+        return "无法连接 GitHub（检查网络/代理）";
+    if (info.reason === "not_found")
+        return "Release 不存在（检查 cursorMcp.updateFeedUrl 配置）";
+    if (info.reason === "forbidden")
+        return "被拒绝：" + (info.message || "403");
+    if (info.reason === "server_error")
+        return "GitHub 服务端异常：" + (info.status || "");
+    if (info.reason === "invalid")
+        return "返回内容无法解析";
+    if (info.reason === "bad_url")
+        return "updateFeedUrl 配置不合法";
+    return info.message || "检查更新失败";
 }
 /** 跟随 302 下载 vsix 到本地 */
 function downloadToFile(url, destPath, maxRedirects = 6) {
@@ -1545,12 +1614,16 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                 if (cmd === "updateCheck") {
                     const current = String(context.extension.packageJSON.version || "");
                     const info = await fetchLatestReleaseInfo();
-                    if (!info) {
+                    if (!info || info.ok === false) {
                         webviewView.webview.postMessage({
                             command: "updateCheckResult",
                             ok: false,
                             current,
-                            msg: "无法连接更新源（检查网络或 cursorMcp.updateFeedUrl）",
+                            reason: info && info.reason,
+                            status: info && info.status,
+                            resetAt: info && info.resetAt,
+                            htmlUrl: info && info.htmlUrl,
+                            msg: updateFailHint(info),
                         });
                         return;
                     }
@@ -1568,11 +1641,29 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                     });
                     return;
                 }
+                if (cmd === "updateOpenReleasePage") {
+                    const raw = String(message.url ?? "").trim();
+                    const target = raw || deriveReleasesHtmlUrl(getUpdateFeedUrl());
+                    try {
+                        if (target)
+                            await vscode.env.openExternal(vscode.Uri.parse(target));
+                    }
+                    catch {
+                        // ignore
+                    }
+                    return;
+                }
                 if (cmd === "updateInstall") {
                     const current = String(context.extension.packageJSON.version || "");
                     const info = await fetchLatestReleaseInfo();
-                    if (!info) {
-                        webviewView.webview.postMessage({ command: "updateInstallResult", ok: false, msg: "无法拉取最新 release" });
+                    if (!info || info.ok === false) {
+                        webviewView.webview.postMessage({
+                            command: "updateInstallResult",
+                            ok: false,
+                            msg: updateFailHint(info),
+                            htmlUrl: info && info.htmlUrl,
+                            reason: info && info.reason,
+                        });
                         return;
                     }
                     if (cmpSemver(current, info.version) >= 0) {
@@ -3668,6 +3759,8 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
       var badgeText = document.getElementById('updateBadgeText');
       if (!badge) return;
       var latestVer = '';
+      var fallbackUrl = '';
+      var fallbackMode = false; // true: 点击打开 release 页；false: 走一键升级
       function setBadge(state, text) {
         badgeText.textContent = text;
         badge.classList.toggle('busy', state === 'busy');
@@ -3676,6 +3769,10 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
       function hide() { badge.style.display = 'none'; }
       badge.addEventListener('click', function () {
         if (badge.classList.contains('busy')) return;
+        if (fallbackMode) {
+          vscodeApi.postMessage({ command: 'updateOpenReleasePage', url: fallbackUrl });
+          return;
+        }
         setBadge('busy', '下载中…');
         vscodeApi.postMessage({ command: 'updateInstall' });
       });
@@ -3688,12 +3785,21 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
         if (msg.command === 'updateCheckResult') {
           if (msg.ok && msg.hasUpdate && msg.hasVsix) {
             latestVer = msg.latest;
+            fallbackUrl = msg.htmlUrl || '';
+            fallbackMode = false;
             setBadge('ready', '有新版 v' + msg.latest);
             badge.title = '点击一键升级：v' + msg.current + ' → v' + msg.latest;
           } else if (msg.ok && msg.hasUpdate && !msg.hasVsix) {
             latestVer = msg.latest;
+            fallbackUrl = msg.htmlUrl || '';
+            fallbackMode = true;
             setBadge('ready', '有新版 v' + msg.latest + '（需手动）');
             badge.title = '点击打开 Releases 页面手动下载';
+          } else if (!msg.ok) {
+            fallbackUrl = msg.htmlUrl || '';
+            fallbackMode = true;
+            setBadge('ready', '检查更新');
+            badge.title = (msg.msg || '检查更新失败') + '\\n点击打开 GitHub Releases 页面';
           } else {
             hide();
           }
@@ -3701,11 +3807,13 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
           setBadge('busy', msg.step === 'downloading' ? '下载 v' + msg.version + '…' : '安装 v' + msg.version + '…');
         } else if (msg.command === 'updateInstallResult') {
           if (msg.ok) {
+            fallbackMode = false;
             setBadge('ready', '已升级到 v' + msg.version);
             badge.title = '请重新加载窗口生效';
           } else {
-            setBadge('ready', '升级失败：点此重试');
-            badge.title = msg.msg || '升级失败，点此重试';
+            if (msg.htmlUrl) { fallbackUrl = msg.htmlUrl; fallbackMode = true; }
+            setBadge('ready', fallbackMode ? '去下载' : '升级失败：点此重试');
+            badge.title = (msg.msg || '升级失败') + (fallbackMode ? '\\n点击打开 Releases 页面手动下载' : '');
           }
         }
       });
