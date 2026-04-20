@@ -9,11 +9,15 @@
 
 ## 一键部署到 Render
 
+> **注意**：插件默认已内置官方云端实例，普通用户**不需要**自己部署。本节适用于想自建私有实例的高级用户。
+
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/2029193370/cursor-mcp)
 
 点上面按钮 → GitHub 登录 → 点 **Apply** → 等 1~2 分钟 → 拿到 `https://fache-server-xxxx.onrender.com`。
 
-Render 会自动读取仓库根的 `render.yaml`，按免费套餐创建 Web Service，并自动生成一个强随机 `PUBLISH_TOKEN`（在 Render 服务页面 → **Environment** 标签里查看和复制，填到 Cursor 设置 `cursorMcp.fachePublishToken` 里即可）。
+Render 会自动读取仓库根的 `render.yaml`，按免费套餐创建 Web Service，默认**不启用** `PUBLISH_TOKEN`，任何人都能发车上车，适合自己多台机器使用。如需限制访问，自行在 Render **Environment** 标签里添加 `PUBLISH_TOKEN` 环境变量，再把同一值填到 Cursor 设置 `cursorMcp.fachePublishToken` 即可。
+
+部署完成后，在 Cursor 设置里把 `cursorMcp.facheApiBaseUrl` 改成自己的 Render 域名（覆盖内置默认值）。
 
 > 免费套餐 15 分钟无请求会休眠，下次请求冷启动约 30~60 秒。需要常热可配外部定时 ping（如 UptimeRobot 每 5 分钟请求 `/health`）。
 
@@ -95,7 +99,9 @@ node server.mjs
 
 ## 客户端配置
 
-在 Cursor 设置里填写：
+**默认情况下，插件已内置官方云端实例 `https://fache-server.onrender.com`，装完插件无需任何配置即可使用云端发车/上车。**
+
+如需自建（本节场景），在 Cursor 设置里把默认地址改成你自己的：
 
 ```
 cursorMcp.facheApiBaseUrl = http://你的机器IP:8787

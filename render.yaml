@@ -12,9 +12,6 @@ services:
     startCommand: node server.mjs
     healthCheckPath: /health
     envVars:
-      # 车头发车必须携带的共享令牌，Render 自动生成强随机值，无需手填
-      - key: PUBLISH_TOKEN
-        generateValue: true
       # 一次性领取，true = pickup 成功即删除
       - key: ONE_SHOT
         value: "true"

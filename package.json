@@ -98,8 +98,8 @@
 				},
 				"cursorMcp.facheApiBaseUrl": {
 					"type": "string",
-					"default": "",
-					"description": "发车云端 API 根地址（无尾部斜杠），例如 https://your.host:8787。发车走 /api/fache/publish 与 /api/fache/pickup。留空时自动回退到 cursorMcp.redeemApiBaseUrl。"
+					"default": "https://fache-server.onrender.com",
+					"description": "发车云端 API 根地址（无尾部斜杠），默认指向本项目官方 Render 实例，开箱即用。如需自建，改成自己的地址即可；留空时自动回退到 cursorMcp.redeemApiBaseUrl。发车走 /api/fache/publish 与 /api/fache/pickup。"
 				},
 				"cursorMcp.facheTicketTtlMs": {
 					"type": "number",

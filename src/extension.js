@@ -1737,7 +1737,7 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         webviewView.webview.postMessage({
                             command: "fcCloudPublishResult",
                             ok: false,
-                            msg: "未配置云端地址：请在 Cursor 设置中填入 cursorMcp.facheApiBaseUrl（或 cursorMcp.redeemApiBaseUrl）",
+                            msg: "云端地址为空：请恢复 cursorMcp.facheApiBaseUrl 默认值，或填入自建地址",
                         });
                         return;
                     }
@@ -1812,7 +1812,7 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         webviewView.webview.postMessage({
                             command: "fcApplyResult",
                             ok: false,
-                            msg: "未配置云端地址：请在 Cursor 设置中填入 cursorMcp.facheApiBaseUrl",
+                            msg: "云端地址为空：请恢复 cursorMcp.facheApiBaseUrl 默认值，或填入自建地址",
                         });
                         return;
                     }
@@ -3162,7 +3162,7 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
       <textarea id="fcTicketOut" class="fc-ticket" rows="3" readonly placeholder="点击「本地 FCT1. 车票」后，此处显示可复制的长车票（完全离线可用）"></textarea>
       <div class="btn-row">
         <button class="btn btn-small" id="fcCopyBtn" disabled>复制 FCT1.</button>
-        <span class="hint">sk- 密钥走云端（需在设置中配置 <code>cursorMcp.facheApiBaseUrl</code>）；FCT1. 长车票不依赖服务器。</span>
+        <span class="hint">sk- 密钥走云端（默认使用官方 Render 实例，如需自建改 <code>cursorMcp.facheApiBaseUrl</code>）；FCT1. 长车票不依赖服务器。</span>
       </div>
     </div>
 
