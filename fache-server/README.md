@@ -7,6 +7,16 @@
 - 默认**一次性领取**（pickup 成功即删除）
 - 可选 `PUBLISH_TOKEN`，要求车头携带 Bearer token 才能发布
 
+## 一键部署到 Render
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/2029193370/cursor-mcp)
+
+点上面按钮 → GitHub 登录 → 点 **Apply** → 等 1~2 分钟 → 拿到 `https://fache-server-xxxx.onrender.com`。
+
+Render 会自动读取仓库根的 `render.yaml`，按免费套餐创建 Web Service，并自动生成一个强随机 `PUBLISH_TOKEN`（在 Render 服务页面 → **Environment** 标签里查看和复制，填到 Cursor 设置 `cursorMcp.fachePublishToken` 里即可）。
+
+> 免费套餐 15 分钟无请求会休眠，下次请求冷启动约 30~60 秒。需要常热可配外部定时 ping（如 UptimeRobot 每 5 分钟请求 `/health`）。
+
 ## 快速启动
 
 ```bash
