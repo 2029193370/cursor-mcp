@@ -329,6 +329,83 @@ function applyCursorFingerprint(fp) {
     }
     return { touched, backupDir, guidResult };
 }
+/* ===== Cursor.exe 实际路径检测（激活时一次性缓存，供发车重启复用） ===== */
+/** 本会话内检测到的 Cursor 主程序绝对路径；activate 时尝试填充 */
+let _detectedCursorExe = "";
+const DETECTED_CURSOR_EXE_KEY = "cursorMcp.detectedCursorExePath";
+function looksLikeCursorExe(p) {
+    return typeof p === "string" && /cursor\.exe$/i.test(p.trim());
+}
+/** 以 WMI 从当前 PID 向上追溯父进程，找第一条以 Cursor.exe 结尾的 ExecutablePath（最多 walk 6 层，超时 6s） */
+function probeCursorExeViaWmi() {
+    if (process.platform !== "win32")
+        return "";
+    const script = `
+$ErrorActionPreference = 'SilentlyContinue';
+$cur = Get-CimInstance Win32_Process -Filter ("ProcessId=" + ${process.pid});
+for ($i = 0; $i -lt 6 -and $cur; $i++) {
+    if ($cur.ExecutablePath -and ($cur.ExecutablePath.ToLower().EndsWith('cursor.exe'))) {
+        Write-Output $cur.ExecutablePath; exit 0
+    }
+    $ppid = $cur.ParentProcessId
+    if (-not $ppid) { break }
+    $cur = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $ppid);
+}
+$any = Get-CimInstance Win32_Process -Filter "Name='Cursor.exe'" | Where-Object { $_.ExecutablePath } | Select-Object -First 1 ExecutablePath;
+if ($any) { Write-Output $any.ExecutablePath }
+`;
+    try {
+        const r = (0, child_process_1.spawnSync)("powershell.exe", [
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script,
+        ], { encoding: "utf8", windowsHide: true, timeout: 6000 });
+        const out = String(r.stdout || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+        return out.find((p) => looksLikeCursorExe(p) && fs.existsSync(p)) || "";
+    }
+    catch {
+        return "";
+    }
+}
+/** 激活时检测并缓存 Cursor.exe 真实路径：快路径 process.execPath，慢路径 WMI 异步兜底。 */
+function detectAndCacheCursorExe(context) {
+    try {
+        const prev = context.globalState.get(DETECTED_CURSOR_EXE_KEY);
+        if (typeof prev === "string" && prev && fs.existsSync(prev)) {
+            _detectedCursorExe = prev;
+        }
+    }
+    catch {
+        // ignore
+    }
+    if (looksLikeCursorExe(process.execPath) && fs.existsSync(process.execPath)) {
+        _detectedCursorExe = process.execPath;
+        try {
+            void context.globalState.update(DETECTED_CURSOR_EXE_KEY, _detectedCursorExe);
+        }
+        catch {
+            // ignore
+        }
+        console.log(`[${viewType}] Cursor.exe detected via execPath = ${_detectedCursorExe}`);
+        return;
+    }
+    if (process.platform !== "win32")
+        return;
+    setTimeout(() => {
+        const p = probeCursorExeViaWmi();
+        if (p) {
+            _detectedCursorExe = p;
+            try {
+                void context.globalState.update(DETECTED_CURSOR_EXE_KEY, p);
+            }
+            catch {
+                // ignore
+            }
+            console.log(`[${viewType}] Cursor.exe detected via WMI = ${p}`);
+        }
+        else {
+            console.warn(`[${viewType}] Cursor.exe detection failed; cached=${_detectedCursorExe || "<none>"}`);
+        }
+    }, 0);
+}
 /** 返回 Cursor.exe 的多路径候选（按可信度从高到低，自动去重，不做 fs.existsSync 过滤） */
 function getCursorExeCandidates() {
     const list = [];
@@ -350,7 +427,10 @@ function getCursorExeCandidates() {
     catch {
         // ignore
     }
-    // 2. 当前正在运行的 Cursor 进程可执行路径（最接近"真实"）
+    // 2. activate 时锁定的真实 Cursor.exe（本次会话自证，最可靠的自动来源）
+    if (_detectedCursorExe)
+        push(_detectedCursorExe);
+    // 3. 当前正在运行的 Cursor 进程可执行路径（实时 WMI 兜底）
     if (process.platform === "win32") {
         try {
             const r = (0, child_process_1.spawnSync)("powershell.exe", [
@@ -365,10 +445,10 @@ function getCursorExeCandidates() {
             // ignore
         }
     }
-    // 3. 当前扩展 Host 进程的 execPath（通常就是 Cursor.exe）
+    // 4. 当前扩展 Host 进程的 execPath（通常就是 Cursor.exe）
     if (process.execPath)
         push(process.execPath);
-    // 4. 常见硬编码路径
+    // 5. 常见硬编码路径
     if (process.platform === "win32") {
         const lad = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
         const pf = process.env.ProgramFiles || "C:\\Program Files";
@@ -406,12 +486,14 @@ function buildApplyAndRestartPowerShell(opts) {
     const esc = (s) => String(s == null ? "" : s).replace(/'/g, "''");
     const candidatesPs = "@(" + (opts.candidates || []).map((c) => `'${esc(c)}'`).join(",") + ")";
     const killDirsPs = "@(" + (opts.killDirs || []).map((c) => `'${esc(c)}'`).join(",") + ")";
+    const lockStoragePs = opts.lockStorage ? "$true" : "$false";
     return `
 $ErrorActionPreference = 'Continue';
 $pendingPath = '${esc(opts.pendingPath)}';
 $userDir     = '${esc(opts.userDir)}';
 $candidates  = ${candidatesPs};
 $killDirs    = ${killDirsPs};
+$lockStorage = ${lockStoragePs};
 $logPath     = Join-Path $env:TEMP ('cursor-mcp-fache-helper-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.log');
 function Log($m) { try { Add-Content -LiteralPath $logPath -Value ('[' + (Get-Date -Format 'HH:mm:ss.fff') + '] ' + $m) -Encoding UTF8 } catch {} }
 Log ("helper started pid=" + $PID + " candidates=" + ($candidates -join '; '));
@@ -467,6 +549,10 @@ if ($fp.machineId) {
 try {
     $spPath = Join-Path $userDir 'User\\globalStorage\\storage.json';
     $spDir = Split-Path $spPath -Parent; if (-not (Test-Path $spDir)) { New-Item -ItemType Directory -Path $spDir -Force | Out-Null }
+    # 写入前先移除只读属性：若上次开启 lockStorage 会在这里卡死
+    if (Test-Path $spPath) {
+        try { (Get-Item -LiteralPath $spPath).IsReadOnly = $false; Log "storage.json readonly cleared" } catch { Log ("clear readonly err: " + $_) }
+    }
     $obj = if (Test-Path $spPath) {
         try { [System.IO.File]::ReadAllText($spPath, $utf8NoBom) | ConvertFrom-Json } catch { New-Object psobject }
     } else { New-Object psobject }
@@ -479,6 +565,9 @@ try {
     $json = $obj | ConvertTo-Json -Depth 100;
     [System.IO.File]::WriteAllText($spPath, $json, $utf8NoBom);
     Log "wrote storage.json";
+    if ($lockStorage) {
+        try { (Get-Item -LiteralPath $spPath).IsReadOnly = $true; Log "storage.json locked (readonly)" } catch { Log ("lock storage err: " + $_) }
+    }
 } catch { Log ("write storage err: " + $_) }
 
 try { Remove-Item -LiteralPath $pendingPath -Force -ErrorAction SilentlyContinue } catch {}
@@ -557,7 +646,8 @@ function scheduleApplyAndRestart(fp) {
     const killDirs = Array.from(new Set(candidates.map((p) => path.dirname(p))));
     const cursorExe = candidates[0] || process.execPath;
     const userDir = getCursorUserDir();
-    const script = buildApplyAndRestartPowerShell({ pendingPath, candidates, killDirs, userDir });
+    const lockStorage = !!vscode.workspace.getConfiguration("cursorMcp").get("facheLockStorageAfterApply");
+    const script = buildApplyAndRestartPowerShell({ pendingPath, candidates, killDirs, userDir, lockStorage });
     const ps1Path = path.join(os.tmpdir(), `cursor-mcp-fache-helper-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.ps1`);
     // 写 UTF-8 BOM，保证 PowerShell 5.1 能正确识别非 ASCII 字面量
     fs.writeFileSync(ps1Path, "\uFEFF" + script, "utf-8");
@@ -570,7 +660,7 @@ function scheduleApplyAndRestart(fp) {
         windowsHide: true,
     });
     child.unref();
-    return { mode: "restart", pendingPath, backupDir, cursorExe, candidates, ps1Path, guidResult };
+    return { mode: "restart", pendingPath, backupDir, cursorExe, candidates, ps1Path, guidResult, lockStorage };
 }
 /** 上车公用流程：弹确认对话框 → 走重启或就地模式 → 回发 fcApplyResult */
 async function handleApplyFlow(webviewView, fp, meta) {
@@ -603,16 +693,20 @@ async function handleApplyFlow(webviewView, fp, meta) {
                     guidLine = `\nMachineGuid：未写入（${s.guidResult.msg || "原因未知"}）`;
                 }
             }
+            const lockLine = s.lockStorage
+                ? "\nstorage.json：写入后将被设为只读，阻止 Cursor 启动时回写 devDeviceId（偏好设置将无法保存，可点「解锁 storage.json」恢复）"
+                : "";
             webviewView.webview.postMessage({
                 command: "fcApplyResult",
                 ok: true,
-                msg: `已调度后台 helper：\n• 约 2-5 秒后 Cursor 将被关闭\n• 关闭完成后写入指纹（含 devDeviceId）\n• 随后自动重新打开 Cursor\n\n重启候选路径（按顺序尝试）：\n${exeLines}\n\n备份：${s.backupDir}${guidLine}\n任务记录：${s.pendingPath}\nhelper 日志：%TEMP%\\cursor-mcp-fache-helper-*.log`,
+                msg: `已调度后台 helper：\n• 约 2-5 秒后 Cursor 将被关闭\n• 关闭完成后写入指纹（含 devDeviceId）\n• 随后自动重新打开 Cursor\n\n重启候选路径（按顺序尝试）：\n${exeLines}\n\n备份：${s.backupDir}${guidLine}${lockLine}\n任务记录：${s.pendingPath}\nhelper 日志：%TEMP%\\cursor-mcp-fache-helper-*.log`,
                 mode: "restart",
                 pendingPath: s.pendingPath,
                 backupDir: s.backupDir,
                 cursorExe: s.cursorExe,
                 candidates: s.candidates || [],
                 guidResult: s.guidResult || null,
+                lockStorage: !!s.lockStorage,
             });
         }
         catch (e) {
@@ -1107,6 +1201,48 @@ function recognizeSpeechWindows(timeoutMs) {
 }
 function activate(context) {
     console.log(`[${viewType}] activate() called`);
+    // 激活即探测本次 Cursor.exe 真实路径，供后续"关闭并重启"流程直接使用
+    detectAndCacheCursorExe(context);
+    // 诊断命令：查看本会话检测到的 Cursor.exe 与所有候选
+    context.subscriptions.push(vscode.commands.registerCommand("cursorMcp.showCursorExe", async () => {
+        const candidates = getCursorExeCandidates();
+        const existing = candidates.filter((p) => { try {
+            return fs.existsSync(p);
+        }
+        catch {
+            return false;
+        } });
+        const detail = [
+            `激活时缓存：${_detectedCursorExe || "<未检测到>"}`,
+            `process.execPath：${process.execPath || "<空>"}`,
+            `process.pid=${process.pid} ppid=${process.ppid ?? "?"}`,
+            "",
+            "候选（按优先顺序，★=文件存在）：",
+            ...candidates.map((p, i) => `  ${i + 1}. ${fs.existsSync(p) ? "★" : "  "} ${p}`),
+        ].join("\n");
+        const copyBtn = "复制到剪贴板";
+        const pick = await vscode.window.showInformationMessage(`Cursor 主程序路径诊断（命中 ${existing.length} / ${candidates.length}）`, { modal: true, detail }, copyBtn);
+        if (pick === copyBtn) {
+            await vscode.env.clipboard.writeText(detail);
+        }
+    }));
+    // 解锁 storage.json：移除只读属性，便于 Cursor 保存偏好
+    context.subscriptions.push(vscode.commands.registerCommand("cursorMcp.unlockStorageJson", async () => {
+        const sp = getCursorStorageJsonPath();
+        if (!fs.existsSync(sp)) {
+            vscode.window.showWarningMessage("storage.json 不存在：" + sp);
+            return;
+        }
+        try {
+            const before = fs.statSync(sp).mode;
+            const wasReadOnly = (before & 0o200) === 0;
+            fs.chmodSync(sp, 0o666);
+            vscode.window.showInformationMessage(`已解锁 storage.json${wasReadOnly ? "（之前为只读）" : "（本来就可写）"}：${sp}`);
+        }
+        catch (e) {
+            vscode.window.showErrorMessage("解锁失败：" + String(e));
+        }
+    }));
     // 配置工作区命令：接收目标路径参数
     context.subscriptions.push(vscode.commands.registerCommand("cursorMcp.configureWorkspace", async (targetPath, sessionOrderOverride) => {
         // 如果没有传入路径，使用当前工作区
@@ -1845,6 +1981,28 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                     if (t) {
                         await vscode.env.clipboard.writeText(t);
                         webviewView.webview.postMessage({ command: "fcClipboardResult", ok: true });
+                    }
+                    return;
+                }
+                if (cmd === "fcUnlockStorage") {
+                    try {
+                        const sp = getCursorStorageJsonPath();
+                        if (!fs.existsSync(sp)) {
+                            webviewView.webview.postMessage({ command: "fcUnlockResult", ok: false, msg: "storage.json 不存在：" + sp });
+                            return;
+                        }
+                        const before = fs.statSync(sp).mode;
+                        const wasReadOnly = (before & 0o200) === 0;
+                        fs.chmodSync(sp, 0o666);
+                        webviewView.webview.postMessage({
+                            command: "fcUnlockResult",
+                            ok: true,
+                            wasReadOnly,
+                            msg: wasReadOnly ? "已解锁 storage.json（之前为只读）" : "storage.json 本来就是可写的，未做改动",
+                        });
+                    }
+                    catch (e) {
+                        webviewView.webview.postMessage({ command: "fcUnlockResult", ok: false, msg: "解锁失败：" + String(e) });
                     }
                     return;
                 }
@@ -3171,6 +3329,7 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
       <div class="btn-row">
         <button class="btn btn-primary" id="fcApplyBtn">上车（覆盖本机指纹）</button>
         <button class="btn" id="fcVerifyBtn" title="读取当前 Cursor 指纹，与上次车头指纹逐字段对比">验证指纹</button>
+        <button class="btn btn-small" id="fcUnlockBtn" title="若开启了 facheLockStorageAfterApply 导致 Cursor 偏好无法保存，点此解锁 storage.json">解锁 storage.json</button>
         <button class="btn btn-small" id="fcOpenBackupBtn2" title="打开备份目录">备份目录</button>
       </div>
       <div class="hint">
@@ -4298,6 +4457,12 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
         fcFeedback('pending', '正在读取本机 Cursor 指纹并与车头对比…');
         vscodeApi.postMessage({ command: 'fcVerifyFingerprint' });
       });
+      var unlockBtn = document.getElementById('fcUnlockBtn');
+      if (unlockBtn) unlockBtn.addEventListener('click', function () {
+        unlockBtn.disabled = true;
+        fcFeedback('pending', '正在解锁 storage.json…');
+        vscodeApi.postMessage({ command: 'fcUnlockStorage' });
+      });
       function esc(s) {
         return String(s == null ? '' : s)
           .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -4435,6 +4600,10 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
             } else {
               fcFeedback('error', msg.msg || '验证失败');
             }
+            break;
+          case 'fcUnlockResult':
+            if (unlockBtn) unlockBtn.disabled = false;
+            fcFeedback(msg.ok ? 'success' : 'error', msg.msg || (msg.ok ? '已解锁' : '解锁失败'));
             break;
           case 'fcCloudPublishResult':
             cloudPubBtn.disabled = false;
