@@ -279,7 +279,7 @@ async function testCloudKey(headDir, riderDir) {
   const TOKEN = "test-tok-" + crypto.randomBytes(4).toString("hex");
 
   const server = spawn(process.execPath, [path.join(ROOT, "fache-server", "server.mjs")], {
-    env: { ...process.env, PORT: String(port), PUBLISH_TOKEN: TOKEN, ONE_SHOT: "true" },
+    env: { ...process.env, PORT: String(port), PUBLISH_TOKEN: TOKEN, DEFAULT_MAX_USES: "1" },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -327,12 +327,49 @@ async function testCloudKey(headDir, riderDir) {
     else fail("pickup 返回的 fp === 车头 fp", JSON.stringify({ got: r2.json.fp, want: fpHead }));
 
     const r3 = await postJson(baseUrl, "/api/fache/pickup", { key: skKey });
-    if (r3.status === 404) pass("一次性取货：二次 pickup 返回 404");
-    else fail("一次性取货：二次 pickup 返回 404", "status=" + r3.status);
+    if (r3.status === 404) pass("默认 1 次取货：二次 pickup 返回 404");
+    else fail("默认 1 次取货：二次 pickup 返回 404", "status=" + r3.status);
 
     const r4 = await postJson(baseUrl, "/api/fache/pickup", { key: "sk-invalid" });
     if (r4.status === 400) pass("非法格式 key 被 400 拒绝");
     else fail("非法格式 key 被 400 拒绝", "status=" + r4.status);
+
+    // maxUses=3：允许领三次，第四次 404；remaining 逐次递减
+    const rM = await postJson(baseUrl, "/api/fache/publish",
+      { fp: fpHead, host: "head", ttlMs: 120000, maxUses: 3 },
+      { authorization: "Bearer " + TOKEN });
+    const keyM = rM.json?.key;
+    if (rM.json?.maxUses === 3 && rM.json?.remaining === 3) pass("publish 返回 maxUses=3 / remaining=3");
+    else fail("publish 返回 maxUses=3 / remaining=3", JSON.stringify(rM.json));
+    const remList = [];
+    for (let i = 0; i < 3; i++) {
+      const rp = await postJson(baseUrl, "/api/fache/pickup", { key: keyM });
+      remList.push(rp.json?.remaining);
+      if (rp.status !== 200 || !rp.json?.ok) {
+        fail(`maxUses=3 第 ${i + 1} 次 pickup`, JSON.stringify(rp));
+        break;
+      }
+    }
+    if (JSON.stringify(remList) === JSON.stringify([2, 1, 0])) pass("maxUses=3 连领 3 次 remaining=[2,1,0]");
+    else fail("maxUses=3 连领 3 次 remaining=[2,1,0]", JSON.stringify(remList));
+    const rp4 = await postJson(baseUrl, "/api/fache/pickup", { key: keyM });
+    if (rp4.status === 404) pass("maxUses=3 用尽后第 4 次 pickup 返回 404");
+    else fail("maxUses=3 用尽后第 4 次 pickup 返回 404", "status=" + rp4.status);
+
+    // maxUses=0 → 无限次（remaining=null）
+    const rInf = await postJson(baseUrl, "/api/fache/publish",
+      { fp: fpHead, host: "head", ttlMs: 120000, maxUses: 0 },
+      { authorization: "Bearer " + TOKEN });
+    const keyInf = rInf.json?.key;
+    if (rInf.json?.maxUses === 0 && rInf.json?.remaining === null) pass("maxUses=0 → remaining=null（无限）");
+    else fail("maxUses=0 → remaining=null（无限）", JSON.stringify(rInf.json));
+    const rInfP1 = await postJson(baseUrl, "/api/fache/pickup", { key: keyInf });
+    const rInfP2 = await postJson(baseUrl, "/api/fache/pickup", { key: keyInf });
+    if (rInfP1.status === 200 && rInfP2.status === 200 && rInfP1.json.remaining === null && rInfP2.json.remaining === null) {
+      pass("maxUses=0 可连续 pickup，remaining 持续为 null");
+    } else {
+      fail("maxUses=0 可连续 pickup", JSON.stringify({ p1: rInfP1.json, p2: rInfP2.json }));
+    }
 
     const r5 = await postJson(baseUrl, "/api/fache/publish",
       { fp: fpHead, host: "head", ttlMs: 999999999999 },

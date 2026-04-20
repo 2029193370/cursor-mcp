@@ -8,8 +8,9 @@ const HOST = process.env.HOST || "0.0.0.0";
 const MAX_TTL_MS = parseInt(process.env.MAX_TTL_MS || String(24 * 3600 * 1000), 10);
 const MIN_TTL_MS = 60 * 1000;
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
-/** 一次性领取：true = pickup 成功即删除；false = 到期前可被多次领取 */
-const ONE_SHOT = (process.env.ONE_SHOT || "true").toLowerCase() !== "false";
+/** 使用次数：>0=有限次，0=无限；发布时客户端传 maxUses 覆盖 */
+const DEFAULT_MAX_USES = Math.max(0, parseInt(process.env.DEFAULT_MAX_USES || "1", 10) || 0);
+const MAX_MAX_USES = Math.max(1, parseInt(process.env.MAX_MAX_USES || "1000", 10) || 1000);
 /** 内存上限：超过则拒绝新的 publish（简单防滥用） */
 const MAX_ENTRIES = parseInt(process.env.MAX_ENTRIES || "5000", 10);
 /** 单条 body 最大字节（防滥发大 payload） */
@@ -18,7 +19,7 @@ const MAX_BODY_BYTES = 64 * 1024;
 const PUBLISH_TOKEN = process.env.PUBLISH_TOKEN || "";
 
 /* ===== 内存存储 ===== */
-/** @type Map<string, {fp:any, host:string, ip:string[], ts:number, expiresAt:number}> */
+/** @type Map<string, {fp:any, host:string, ip:string[], ts:number, expiresAt:number, maxUses:number, uses:number}> */
 const store = new Map();
 
 function nowMs() { return Date.now(); }
@@ -84,6 +85,19 @@ function clampTtl(x) {
   return Math.min(MAX_TTL_MS, Math.max(MIN_TTL_MS, n));
 }
 
+/** 规范化 maxUses：缺省=DEFAULT_MAX_USES；<=0 或非数字=0（无限）；否则夹紧到 [1, MAX_MAX_USES] */
+function clampMaxUses(x) {
+  if (x == null) return DEFAULT_MAX_USES;
+  const n = Math.floor(+x);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(MAX_MAX_USES, n);
+}
+
+/** 剩余可用次数；maxUses=0 表示无限 */
+function remainingOf(rec) {
+  return rec.maxUses === 0 ? null : Math.max(0, rec.maxUses - rec.uses);
+}
+
 function validFp(fp) {
   if (!fp || typeof fp !== "object") return false;
   const keys = ["machineId", "devDeviceId", "telemetryMachineId", "macMachineId", "sqmId", "machineGuid"];
@@ -114,6 +128,7 @@ async function handlePublish(req, res) {
   }
 
   const ttlMs = clampTtl(body.ttlMs);
+  const maxUses = clampMaxUses(body.maxUses);
   const host = typeof body.host === "string" ? body.host.slice(0, 128) : "";
   const ip = Array.isArray(body.ip) ? body.ip.filter((s) => typeof s === "string").slice(0, 16).map((s) => s.slice(0, 64)) : [];
   let key;
@@ -131,10 +146,19 @@ async function handlePublish(req, res) {
     ip,
     ts: nowMs(),
     expiresAt: nowMs() + ttlMs,
+    maxUses,
+    uses: 0,
   };
   store.set(key, rec);
-  console.log(`[publish] key=${key} host=${host} ttl=${ttlMs} size=${store.size}`);
-  sendJson(res, 200, { ok: true, key, expiresAt: rec.expiresAt, ttlMs });
+  console.log(`[publish] key=${key} host=${host} ttl=${ttlMs} maxUses=${maxUses || "∞"} size=${store.size}`);
+  sendJson(res, 200, {
+    ok: true,
+    key,
+    expiresAt: rec.expiresAt,
+    ttlMs,
+    maxUses,
+    remaining: remainingOf(rec),
+  });
 }
 
 async function handlePickup(req, res) {
@@ -152,14 +176,19 @@ async function handlePickup(req, res) {
     store.delete(key);
     return sendJson(res, 410, { ok: false, message: "key expired" });
   }
-  if (ONE_SHOT) store.delete(key);
-  console.log(`[pickup] key=${key} remain=${store.size} one-shot=${ONE_SHOT}`);
+  rec.uses += 1;
+  const remaining = remainingOf(rec);
+  if (remaining === 0) store.delete(key);
+  console.log(`[pickup] key=${key} uses=${rec.uses}/${rec.maxUses || "∞"} remain=${store.size}`);
   sendJson(res, 200, {
     ok: true,
     fp: rec.fp,
     host: rec.host,
     ip: rec.ip,
     ts: rec.ts,
+    maxUses: rec.maxUses,
+    uses: rec.uses,
+    remaining,
   });
 }
 
@@ -174,7 +203,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
-    sendJson(res, 200, { ok: true, service: "cursor-mcp-fache", size: store.size, oneShot: ONE_SHOT });
+    sendJson(res, 200, {
+      ok: true,
+      service: "cursor-mcp-fache",
+      size: store.size,
+      defaultMaxUses: DEFAULT_MAX_USES,
+      maxMaxUses: MAX_MAX_USES,
+    });
     return;
   }
   if (req.method !== "POST") {
@@ -189,7 +224,8 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`[fache-server] listening on http://${HOST}:${PORT}`);
   console.log(`  POST /api/fache/publish   -> 车头发布指纹，返回 sk-xxxxxxxxxxxxxxxxx`);
-  console.log(`  POST /api/fache/pickup    -> 乘客用 key 领取指纹${ONE_SHOT ? "（一次性）" : "（可重复领取直到过期）"}`);
+  console.log(`  POST /api/fache/pickup    -> 乘客用 key 领取指纹（按 maxUses 计数，用尽或过期自动删除）`);
   console.log(`  TTL  min=${MIN_TTL_MS}ms  default=${DEFAULT_TTL_MS}ms  max=${MAX_TTL_MS}ms`);
+  console.log(`  USES default=${DEFAULT_MAX_USES || "∞"}  max=${MAX_MAX_USES}`);
   if (PUBLISH_TOKEN) console.log(`  PUBLISH_TOKEN enabled (Authorization: Bearer <token>)`);
 });

@@ -12,9 +12,12 @@ services:
     startCommand: node server.mjs
     healthCheckPath: /health
     envVars:
-      # 一次性领取，true = pickup 成功即删除
-      - key: ONE_SHOT
-        value: "true"
+      # 默认使用次数（客户端 publish 时可传 maxUses 覆盖；0 表示无限次）
+      - key: DEFAULT_MAX_USES
+        value: "1"
+      # 单张车票使用次数上限（防滥用）
+      - key: MAX_MAX_USES
+        value: "1000"
       # 车票最长存活 24 小时
       - key: MAX_TTL_MS
         value: "86400000"

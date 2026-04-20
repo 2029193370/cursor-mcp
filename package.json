@@ -2,7 +2,7 @@
 	"name": "cursor-mcp",
 	"displayName": "Cursor MCP",
 	"description": "Cursor 侧栏多路 MCP 扩展：支持多项目与多工作区并行、多窗口独立通道；消息随附截图/文件、会话备忘等能力。",
-	"version": "1.2.3",
+	"version": "1.2.4",
 	"publisher": "litingfeng",
 	"author": {
 		"name": "litingfeng",
@@ -116,6 +116,11 @@
 					"type": "number",
 					"default": 600000,
 					"description": "云端 sk- 车票默认有效期（毫秒），发布时随 body 一同发给服务端，范围 60000–86400000，默认 10 分钟。"
+				},
+				"cursorMcp.facheMaxUses": {
+					"type": "number",
+					"default": 1,
+					"description": "云端 sk- 车票默认使用次数（0 表示无限，仅受车票有效期限制；>0 表示到达次数上限后自动失效）。发车面板上的「使用次数」选择框以此值为默认。"
 				},
 				"cursorMcp.fachePublishToken": {
 					"type": "string",

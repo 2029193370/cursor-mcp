@@ -761,6 +761,13 @@ function getFacheTicketTtlMs() {
     const x = typeof v === "number" ? Math.floor(v) : 600000;
     return Math.min(24 * 3600 * 1000, Math.max(60000, x));
 }
+/** 默认 sk- 车票使用次数；0 = 无限；>0 = 有限 */
+function getFacheMaxUses() {
+    const cfg = vscode.workspace.getConfiguration("cursorMcp");
+    const v = cfg.get("facheMaxUses");
+    const x = typeof v === "number" ? Math.floor(v) : 1;
+    return Number.isFinite(x) && x > 0 ? Math.min(1000, x) : 0;
+}
 function getFacheHttpTimeoutMs() {
     const cfg = vscode.workspace.getConfiguration("cursorMcp");
     const v = cfg.get("redeemTimeoutMs");
@@ -1812,6 +1819,7 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         userDir: getCursorUserDir(),
                         platform: process.platform,
                         defaultTtlMs: getFacheTicketTtlMs(),
+                        defaultMaxUses: getFacheMaxUses(),
                         cursorExe,
                         cursorCandidates,
                     });
@@ -1902,6 +1910,10 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                     const ttlMs = Number.isFinite(reqTtl) && reqTtl > 0
                         ? Math.min(24 * 3600 * 1000, Math.max(60000, Math.floor(reqTtl)))
                         : getFacheTicketTtlMs();
+                    const reqUses = Number(message.maxUses);
+                    const maxUses = Number.isFinite(reqUses) && reqUses >= 0
+                        ? Math.min(1000, Math.floor(reqUses))
+                        : getFacheMaxUses();
                     const tokenRaw = vscode.workspace.getConfiguration("cursorMcp").get("fachePublishToken");
                     const token = typeof tokenRaw === "string" ? tokenRaw.trim() : "";
                     const headers = token ? { authorization: "Bearer " + token } : undefined;
@@ -1910,6 +1922,7 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         host: os.hostname(),
                         ip: getLocalIps(),
                         ttlMs,
+                        maxUses,
                     }, headers);
                     if (r.status === 401) {
                         webviewView.webview.postMessage({
@@ -1928,6 +1941,10 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                     }
                     const key = r.json && typeof r.json.key === "string" ? r.json.key : "";
                     const expiresAt = r.json && typeof r.json.expiresAt === "number" ? r.json.expiresAt : Date.now() + ttlMs;
+                    const srvMaxUses = r.json && typeof r.json.maxUses === "number" ? r.json.maxUses : maxUses;
+                    const srvRemaining = r.json && (typeof r.json.remaining === "number" || r.json.remaining === null)
+                        ? r.json.remaining
+                        : (srvMaxUses > 0 ? srvMaxUses : null);
                     if (!isValidShortKey(key)) {
                         webviewView.webview.postMessage({
                             command: "fcCloudPublishResult",
@@ -1942,6 +1959,8 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         key,
                         expiresAt,
                         base,
+                        maxUses: srvMaxUses,
+                        remaining: srvRemaining,
                     });
                     return;
                 }
@@ -1981,6 +2000,14 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         ts: parsed.ts || Date.now(),
                         src: "cloud",
                         savedAt: Date.now(),
+                    });
+                    webviewView.webview.postMessage({
+                        command: "fcCloudPickupInfo",
+                        maxUses: typeof parsed.maxUses === "number" ? parsed.maxUses : null,
+                        uses: typeof parsed.uses === "number" ? parsed.uses : null,
+                        remaining: (typeof parsed.remaining === "number" || parsed.remaining === null)
+                            ? parsed.remaining
+                            : undefined,
                     });
                     await handleApplyFlow(webviewView, parsed.fp, {
                         host: parsed.host,
@@ -3312,10 +3339,24 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
           <option value="custom">自定义…</option>
         </select>
         <input type="number" id="fcTtlCustom" class="fc-ttl-custom" min="1" max="1440" step="1" placeholder="分钟" style="display:none" />
-        <span class="hint fc-ttl-hint" id="fcTtlHint">一次性领取；过期自动删除</span>
+        <span class="hint fc-ttl-hint" id="fcTtlHint">可用 1 次；过期或次数用尽自动删除</span>
+      </div>
+      <div class="fc-ttl-row">
+        <label class="fc-ttl-label" for="fcUsesSelect">使用次数</label>
+        <select id="fcUsesSelect" class="fc-ttl-select" title="到达使用次数上限后车票自动失效">
+          <option value="1" selected>1 次（用完即删）</option>
+          <option value="2">2 次</option>
+          <option value="3">3 次</option>
+          <option value="5">5 次</option>
+          <option value="10">10 次</option>
+          <option value="0">无限（仅受有效期限制）</option>
+          <option value="custom">自定义…</option>
+        </select>
+        <input type="number" id="fcUsesCustom" class="fc-ttl-custom" min="1" max="1000" step="1" placeholder="次数" style="display:none" />
+        <span class="hint">默认值读取 <code>cursorMcp.facheMaxUses</code></span>
       </div>
       <div class="btn-row">
-        <button class="btn btn-primary" id="fcCloudPubBtn" title="云端发车：生成 20 位 sk- 密钥，一次性领取">云端 sk- 密钥</button>
+        <button class="btn btn-primary" id="fcCloudPubBtn" title="云端发车：生成 20 位 sk- 密钥，按使用次数自动失效">云端 sk- 密钥</button>
         <button class="btn" id="fcGenBtn" title="本地发车：生成完整 FCT1. 车票，无需联网">本地 FCT1. 车票</button>
         <button class="btn btn-small" id="fcOpenBackupBtn" title="打开备份目录">备份</button>
       </div>
@@ -3327,6 +3368,7 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
           <button class="btn btn-small" id="fcKeyCopyBtn">复制</button>
         </div>
         <div class="fc-key-hint" id="fcKeyExpires">—</div>
+        <div class="fc-key-hint" id="fcKeyUses">—</div>
       </div>
 
       <textarea id="fcTicketOut" class="fc-ticket" rows="3" readonly placeholder="点击「本地 FCT1. 车票」后，此处显示可复制的长车票（完全离线可用）"></textarea>
@@ -4335,6 +4377,10 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
       var keyCopyBtn = document.getElementById('fcKeyCopyBtn');
       var ttlSelect = document.getElementById('fcTtlSelect');
       var ttlCustom = document.getElementById('fcTtlCustom');
+      var ttlHint = document.getElementById('fcTtlHint');
+      var usesSelect = document.getElementById('fcUsesSelect');
+      var usesCustom = document.getElementById('fcUsesCustom');
+      var keyUsesEl = document.getElementById('fcKeyUses');
       var keyExpiresAt = 0;
       var keyTimer = null;
       var FC_TTL_MIN_MS = 60 * 1000;
@@ -4349,9 +4395,32 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
         var v = parseInt(ttlSelect.value, 10);
         return Math.min(FC_TTL_MAX_MS, Math.max(FC_TTL_MIN_MS, v || 600000));
       }
+      function getSelectedMaxUses() {
+        if (!usesSelect) return 1;
+        if (usesSelect.value === 'custom') {
+          var n = parseInt(usesCustom && usesCustom.value, 10);
+          if (!n || n < 1) n = 1;
+          return Math.min(1000, n);
+        }
+        var v = parseInt(usesSelect.value, 10);
+        return v >= 0 ? Math.min(1000, v) : 1;
+      }
+      function usesLabel(n) { return n === 0 ? '无限' : (n + ' 次'); }
+      function updateTtlHint() {
+        if (!ttlHint) return;
+        var n = getSelectedMaxUses();
+        ttlHint.textContent = n === 0
+          ? '可用无限次；过期自动删除'
+          : '可用 ' + n + ' 次；过期或次数用尽自动删除';
+      }
       if (ttlSelect) ttlSelect.addEventListener('change', function () {
         if (ttlCustom) ttlCustom.style.display = ttlSelect.value === 'custom' ? '' : 'none';
       });
+      if (usesSelect) usesSelect.addEventListener('change', function () {
+        if (usesCustom) usesCustom.style.display = usesSelect.value === 'custom' ? '' : 'none';
+        updateTtlHint();
+      });
+      if (usesCustom) usesCustom.addEventListener('input', updateTtlHint);
 
       function fcFeedback(type, text) {
         if (!fbEl) return;
@@ -4544,8 +4613,9 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
       if (cloudPubBtn) cloudPubBtn.addEventListener('click', function () {
         cloudPubBtn.disabled = true;
         var ttlMs = getSelectedTtlMs();
-        fcFeedback('pending', '正在向云端发布指纹（有效期 ' + Math.round(ttlMs / 60000) + ' 分钟）…');
-        vscodeApi.postMessage({ command: 'fcCloudPublish', ttlMs: ttlMs });
+        var maxUses = getSelectedMaxUses();
+        fcFeedback('pending', '正在向云端发布指纹（有效期 ' + Math.round(ttlMs / 60000) + ' 分钟，可用 ' + usesLabel(maxUses) + '）…');
+        vscodeApi.postMessage({ command: 'fcCloudPublish', ttlMs: ttlMs, maxUses: maxUses });
       });
       if (keyCopyBtn) keyCopyBtn.addEventListener('click', function () {
         var v = keyValueEl ? keyValueEl.textContent : '';
@@ -4575,6 +4645,21 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
                   ttlCustom.value = String(Math.max(1, Math.round(msg.defaultTtlMs / 60000)));
                 }
               }
+            }
+            if (usesSelect && typeof msg.defaultMaxUses === 'number') {
+              var u = String(msg.defaultMaxUses);
+              var uhit = Array.prototype.some.call(usesSelect.options, function (o) { return o.value === u; });
+              if (uhit) {
+                usesSelect.value = u;
+                if (usesCustom) usesCustom.style.display = 'none';
+              } else {
+                usesSelect.value = 'custom';
+                if (usesCustom) {
+                  usesCustom.style.display = '';
+                  usesCustom.value = String(Math.max(1, msg.defaultMaxUses));
+                }
+              }
+              updateTtlHint();
             }
             break;
           case 'fcTicketResult':
@@ -4626,11 +4711,19 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
               if (keyTimer) clearInterval(keyTimer);
               tickKeyExpires();
               keyTimer = setInterval(tickKeyExpires, 1000);
-              fcFeedback('success', '云端发车成功：把上方 sk- 密钥发给乘客即可（一次性领取）');
+              var mu = (typeof msg.maxUses === 'number') ? msg.maxUses : getSelectedMaxUses();
+              if (keyUsesEl) keyUsesEl.textContent = '可用 ' + usesLabel(mu);
+              fcFeedback('success', '云端发车成功：sk- 密钥可用 ' + usesLabel(mu) + '，把上方密钥发给乘客即可');
             } else {
               if (keyBox) keyBox.style.display = 'none';
               fcFeedback('error', msg.msg || '云端发车失败');
             }
+            break;
+          case 'fcCloudPickupInfo':
+            var rmTxt = (msg.maxUses === 0 || msg.remaining === null)
+              ? '车票为无限次（仅受有效期限制）'
+              : ('已领取；本车票剩余可用 ' + (typeof msg.remaining === 'number' ? msg.remaining : '?') + ' 次');
+            addMessage('system', rmTxt);
             break;
           case 'fcClipboardResult':
             if (msg.ok) fcFeedback('success', '已复制到剪贴板');

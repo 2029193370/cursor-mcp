@@ -4,7 +4,7 @@
 
 - 纯 Node 标准库实现，**零依赖**
 - 内存存储 + TTL 自动过期
-- 默认**一次性领取**（pickup 成功即删除）
+- **可自定义使用次数**：车头发布时可指定 `maxUses`（默认 1 次，0 表示无限），达到次数上限或过期自动删除
 - 可选 `PUBLISH_TOKEN`，要求车头携带 Bearer token 才能发布
 
 ## 一键部署到 Render
@@ -37,7 +37,8 @@ node server.mjs
 | `PORT` | `8787` | 监听端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `MAX_TTL_MS` | `86400000` (24h) | 单条车票最长 TTL |
-| `ONE_SHOT` | `true` | 领取后是否立即删除；`false` 表示到期前可多次领取 |
+| `DEFAULT_MAX_USES` | `1` | 发布时未传 `maxUses` 的默认使用次数；`0` 表示无限 |
+| `MAX_MAX_USES` | `1000` | 单张车票可设置的使用次数上限（客户端传入超过会被夹紧） |
 | `MAX_ENTRIES` | `5000` | 内存中最多同时存在的车票数，达到上限拒绝新发布 |
 | `PUBLISH_TOKEN` | 空 | 若设置，则 publish 需 `Authorization: Bearer <token>` |
 
@@ -58,14 +59,19 @@ node server.mjs
   },
   "host": "DESKTOP-XXXX",
   "ip": ["以太网:192.168.1.100"],
-  "ttlMs": 600000
+  "ttlMs": 600000,
+  "maxUses": 1
 }
 ```
 
+`maxUses` 可选：缺省走服务端 `DEFAULT_MAX_USES`；`>0` 表示有限次数（夹紧到 `[1, MAX_MAX_USES]`）；`0` 或负数表示无限次（到期才删）。
+
 响应：
 ```json
-{ "ok": true, "key": "sk-xxxxxxxxxxxxxxxxx", "expiresAt": 1734567890000, "ttlMs": 600000 }
+{ "ok": true, "key": "sk-xxxxxxxxxxxxxxxxx", "expiresAt": 1734567890000, "ttlMs": 600000, "maxUses": 1, "remaining": 1 }
 ```
+
+`remaining` 为 `null` 时表示无限次。
 
 ### `POST /api/fache/pickup`
 
@@ -81,21 +87,26 @@ node server.mjs
   "fp": { "...": "..." },
   "host": "DESKTOP-XXXX",
   "ip": ["..."],
-  "ts": 1734567880000
+  "ts": 1734567880000,
+  "maxUses": 3,
+  "uses": 1,
+  "remaining": 2
 }
 ```
+
+`remaining` 为 `null` 时表示无限次。`remaining` 降为 `0` 时服务端会同步删除该 key，后续再领取会返回 `404`。
 
 错误响应统一为 `{ "ok": false, "message": "..." }`，HTTP 状态码：
 - `400` 参数错误
 - `401` token 不匹配
-- `404` key 不存在或已领取
+- `404` key 不存在或已用尽
 - `410` key 已过期
 - `413` body 过大（单条上限 64KB）
 - `503` 服务繁忙（超过 `MAX_ENTRIES`）
 
 ### `GET /health`
 
-健康检查，返回 `{ ok: true, service: "cursor-mcp-fache", size: <N>, oneShot: <bool> }`。
+健康检查，返回 `{ ok: true, service: "cursor-mcp-fache", size: <N>, defaultMaxUses: <N>, maxMaxUses: <N> }`。
 
 ## 客户端配置
 
