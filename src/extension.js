@@ -527,7 +527,19 @@ while ((Get-Date) -lt $deadline) {
 }
 Start-Sleep -Seconds 2;
 $ps = Get-CursorProcesses -SelfPid $PID;
-if ($ps) { Log 'some cursor processes still alive; proceeding anyway' }
+if ($ps) {
+    # 兜底：killDirs 过滤被卡住时，对每个残余 PID 用 Stop-Process + taskkill 双保险强杀（跳过 killDirs 过滤）
+    Log ('fallback kill triggered: ' + ($ps | Measure-Object).Count + ' cursor procs still alive after deadline');
+    $residue = Get-Process -Name 'Cursor' -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID };
+    foreach ($p in $residue) {
+        try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
+        try { & taskkill.exe /F /PID $p.Id 2>&1 | Out-Null } catch {}
+    }
+    Start-Sleep -Seconds 2;
+    $still = Get-Process -Name 'Cursor' -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID };
+    if ($still) { Log ('still alive after fallback: ' + ($still | Measure-Object).Count + ' procs; proceeding anyway') }
+    else { Log 'fallback kill succeeded, all cursor procs cleared' }
+}
 
 if (-not (Test-Path $pendingPath)) { Log ("pending missing: " + $pendingPath); exit 1 }
 try {
