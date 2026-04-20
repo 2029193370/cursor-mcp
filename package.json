@@ -2,7 +2,7 @@
 	"name": "cursor-mcp",
 	"displayName": "Cursor MCP",
 	"description": "Cursor 侧栏多路 MCP 扩展：支持多项目与多工作区并行、多窗口独立通道；消息随附截图/文件、会话备忘等能力。",
-	"version": "1.2.1",
+	"version": "1.2.2",
 	"publisher": "litingfeng",
 	"author": {
 		"name": "litingfeng",
@@ -124,8 +124,8 @@
 				},
 				"cursorMcp.facheLockStorageAfterApply": {
 					"type": "boolean",
-					"default": false,
-					"description": "上车写入指纹成功后，是否把 storage.json 设为只读（仅 Windows 生效）。开启后可阻止 Cursor 启动时把 devDeviceId 回写成硬件派生值，让指纹 6 项保持与车头完全一致。副作用：Cursor 在只读期间无法持久化主题、窗口位置、最近打开的工作区等偏好设置。下次想修改偏好请先运行「Cursor MCP：解锁 storage.json」命令，或点侧栏「上车」面板的「解锁 storage.json」按钮。默认关闭。"
+					"default": true,
+					"description": "上车写入指纹成功后，是否把 storage.json 设为只读（仅 Windows 生效）。默认**开启**（v1.2.2+），这是让 devDeviceId 保持与车头一致的**关键机关**：Cursor 启动时会基于系统硬件信息重新派生 devDeviceId 并回写 storage.json，只读锁是目前唯一能根治这个回写的办法。副作用：Cursor 在只读期间无法持久化主题、窗口位置、最近打开的工作区等偏好。下次想修改偏好请先运行「Cursor MCP：解锁 storage.json」命令，或点侧栏「上车」面板的「解锁 storage.json」按钮；改完后再上车一次会重新上锁。若你不需要指纹同步（只把插件当 MCP 管理器用），可关闭此项。"
 				},
 				"cursorMcp.facheSyncMachineGuid": {
 					"type": "string",

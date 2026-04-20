@@ -3333,7 +3333,7 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
         <button class="btn btn-small" id="fcOpenBackupBtn2" title="打开备份目录">备份目录</button>
       </div>
       <div class="hint">
-        上车前会自动把本机旧指纹备份到 <code>Cursor/cursor-mcp-fp-backup</code>。<strong>请先退出 Cursor 再点「上车」</strong>，写入后重新启动 Cursor 才会生效。Windows 上若车票含 MachineGuid，会弹出 UAC 请求管理员权限写注册表。重启 Cursor 后回到此处点「验证指纹」，可逐字段对比是否与车头一致。
+        上车前会自动把本机旧指纹备份到 <code>Cursor/cursor-mcp-fp-backup</code>。<strong>请先退出 Cursor 再点「上车」</strong>，写入后重新启动 Cursor 才会生效。Windows 上若车票含 MachineGuid，会弹出 UAC 请求管理员权限写注册表。重启 Cursor 后回到此处点「验证指纹」，可逐字段对比是否与车头一致。<br><strong>默认会把 storage.json 锁成只读</strong>以阻止 Cursor 启动时把 devDeviceId 回写（需要改 Cursor 主题/窗口位置时先点「解锁 storage.json」；可在设置 <code>cursorMcp.facheLockStorageAfterApply</code> 里关闭此行为）。
       </div>
       <div class="fc-verify-box" id="fcVerifyBox" style="display:none"></div>
     </div>
