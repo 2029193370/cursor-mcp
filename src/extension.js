@@ -37,6 +37,8 @@ const viewType = "cursorMcp.sidebar";
 /* ===== 发车（Cursor 设备指纹同步） ===== */
 const TICKET_PREFIX = "FCT1.";
 const FP_BACKUP_DIRNAME = "cursor-mcp-fp-backup";
+/** 上车后保存车头指纹，供「验证指纹」按钮对比 */
+const GLOBAL_STATE_LAST_PICKUP_KEY = "cursorMcp.lastPickup.v1";
 /** Cursor 用户目录（跨平台） */
 function getCursorUserDir() {
     if (process.platform === "win32") {
@@ -68,13 +70,67 @@ function readWindowsMachineGuid() {
         return null;
     }
 }
-/** 尝试以管理员身份写回 Windows MachineGuid */
-function writeWindowsMachineGuid(guid) {
+/** 读取 MachineGuid 同步模式：auto / always / never，默认 auto */
+function getMachineGuidMode() {
+    try {
+        const v = vscode.workspace.getConfiguration("cursorMcp").get("facheSyncMachineGuid");
+        if (v === "never" || v === "always" || v === "auto")
+            return v;
+    }
+    catch {
+        // ignore
+    }
+    return "auto";
+}
+// 轻量缓存：一个进程生命周期内权限不会变
+let _elevatedCache = null;
+/** 当前 Cursor 进程是否已以管理员身份启动（Windows）。用 fsutil dirty query 探测，admin 才返回 0 */
+function isCurrentProcessElevated() {
+    if (process.platform !== "win32")
+        return false;
+    if (_elevatedCache !== null)
+        return _elevatedCache;
+    try {
+        const sysDrive = (process.env.SystemDrive || "C:").replace(/\\$/, "");
+        const r = (0, child_process_1.spawnSync)("fsutil", ["dirty", "query", sysDrive], {
+            encoding: "utf8", windowsHide: true, timeout: 3000,
+        });
+        _elevatedCache = r.status === 0;
+    }
+    catch {
+        _elevatedCache = false;
+    }
+    return _elevatedCache;
+}
+/**
+ * 写回 Windows MachineGuid。
+ * mode:
+ *   - "never":  静默跳过
+ *   - "auto":   当前进程已提权则直写（无 UAC，快）；否则自动回落到 UAC 提权路径（保证"点一次上车就全部写好"）
+ *   - "always": 强制走 Start-Process -Verb RunAs 提权路径（即使已提权也走一遍，用于测试或保守用户）
+ */
+function writeWindowsMachineGuid(guid, mode) {
+    const m = mode || "auto";
+    if (m === "never")
+        return { ok: false, skipped: true, msg: "已按配置跳过（facheSyncMachineGuid=never）" };
     if (process.platform !== "win32")
         return { ok: false, msg: "仅 Windows 支持 MachineGuid 修改" };
     const safe = String(guid || "").trim();
     if (!/^[0-9a-fA-F-]{8,}$/.test(safe))
         return { ok: false, msg: "MachineGuid 格式不合法" };
+    // auto 且已提权：直接 reg add，无 UAC、快速返回
+    if (m === "auto" && isCurrentProcessElevated()) {
+        try {
+            const r = (0, child_process_1.spawnSync)("reg", ["add", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid", "/t", "REG_SZ", "/d", safe, "/f"], { encoding: "utf8", windowsHide: true });
+            if (r.status === 0)
+                return { ok: true };
+            return { ok: false, msg: `写注册表失败，退出码 ${r.status}` };
+        }
+        catch (e) {
+            return { ok: false, msg: String(e) };
+        }
+    }
+    // auto 非管理员 / always：走 UAC 提权。若用户拒绝，返回失败但不影响其他 5 个字段
     const sysRoot = process.env.SystemRoot || "C:\\Windows";
     const psExe = path.join(sysRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     const inner = `reg add \"HKLM\\SOFTWARE\\Microsoft\\Cryptography\" /v MachineGuid /t REG_SZ /d ${safe} /f`;
@@ -84,7 +140,7 @@ function writeWindowsMachineGuid(guid) {
         const r = (0, child_process_1.spawnSync)(psExe, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], { encoding: "utf8", windowsHide: true });
         if (r.status === 0)
             return { ok: true };
-        return { ok: false, msg: `写注册表失败（用户可能拒绝了管理员授权），退出码 ${r.status}` };
+        return { ok: false, msg: `写注册表失败（用户可能在 UAC 弹窗拒绝了管理员授权），退出码 ${r.status}` };
     }
     catch (e) {
         return { ok: false, msg: String(e) };
@@ -128,7 +184,9 @@ function readCursorFingerprint() {
     catch {
         // ignore
     }
-    fp.machineGuid = readWindowsMachineGuid();
+    if (getMachineGuidMode() !== "never") {
+        fp.machineGuid = readWindowsMachineGuid();
+    }
     return fp;
 }
 function getLocalIps() {
@@ -181,6 +239,31 @@ function parseTicket(tok) {
         return null;
     }
 }
+/** 字段级对比两份指纹，返回每个字段的 match/expected/actual */
+function compareFingerprints(expected, actual) {
+    const fields = ["machineId", "devDeviceId", "telemetryMachineId", "macMachineId", "sqmId", "machineGuid"];
+    const rows = [];
+    let matched = 0;
+    let checked = 0;
+    for (const k of fields) {
+        const e = expected && expected[k] ? String(expected[k]) : null;
+        const a = actual && actual[k] ? String(actual[k]) : null;
+        // 车头那边为空（例如 never 模式或服务端没该字段）：跳过比较，不计入分母
+        if (!e) {
+            rows.push({ key: k, status: "skipped", expected: null, actual: a });
+            continue;
+        }
+        checked += 1;
+        // 对 machineGuid 做大小写不敏感对比（注册表写入可能改变大小写表现）
+        const eq = k === "machineGuid"
+            ? e.toLowerCase() === String(a || "").toLowerCase()
+            : e === a;
+        if (eq)
+            matched += 1;
+        rows.push({ key: k, status: eq ? "match" : "mismatch", expected: e, actual: a });
+    }
+    return { rows, matched, checked, allMatch: checked > 0 && matched === checked };
+}
 /** 把车票指纹写入本机 Cursor（含备份） */
 function applyCursorFingerprint(fp) {
     const touched = [];
@@ -232,13 +315,14 @@ function applyCursorFingerprint(fp) {
         }
     }
     let guidResult = null;
-    if (process.platform === "win32" && fp.machineGuid) {
+    const mguidMode = getMachineGuidMode();
+    if (process.platform === "win32" && fp.machineGuid && mguidMode !== "never") {
         const cur = readWindowsMachineGuid();
         if (cur && cur.toLowerCase() === String(fp.machineGuid).toLowerCase()) {
             guidResult = { ok: true, skipped: true };
         }
         else {
-            guidResult = writeWindowsMachineGuid(fp.machineGuid);
+            guidResult = writeWindowsMachineGuid(fp.machineGuid, mguidMode);
             if (guidResult.ok)
                 touched.push("MachineGuid(注册表)");
         }
@@ -397,16 +481,6 @@ try {
     Log "wrote storage.json";
 } catch { Log ("write storage err: " + $_) }
 
-if ($pending.updateMachineGuid -and $fp.machineGuid) {
-    try {
-        $guid = [string]$fp.machineGuid;
-        if ($guid -match '^[0-9a-fA-F-]{8,}$') {
-            & reg add "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid /t REG_SZ /d $guid /f | Out-Null;
-            Log ("wrote MachineGuid = " + $guid + " exit=" + $LASTEXITCODE);
-        }
-    } catch { Log ("write MachineGuid err: " + $_) }
-}
-
 try { Remove-Item -LiteralPath $pendingPath -Force -ErrorAction SilentlyContinue } catch {}
 
 # 启动 Cursor：按 candidates 顺序 ShellExecute（等价于双击）+ WorkingDirectory 指到 exe 目录，
@@ -444,10 +518,24 @@ try { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction 
 function scheduleApplyAndRestart(fp) {
     if (process.platform !== "win32") {
         const r = applyCursorFingerprint(fp);
-        return { mode: "in-place", touched: r.touched, backupDir: r.backupDir, pendingPath: "" };
+        return { mode: "in-place", touched: r.touched, backupDir: r.backupDir, pendingPath: "", guidResult: r.guidResult };
+    }
+    // MachineGuid 放在主进程（当前用户交互期间）处理：
+    // - helper 在 Cursor 退出后才运行，此时再弹 UAC 体验差；
+    // - 主进程提前写好也便于在成功对话里即时反馈。
+    const mguidMode = getMachineGuidMode();
+    let guidResult = null;
+    if (fp.machineGuid && mguidMode !== "never") {
+        const cur = readWindowsMachineGuid();
+        if (cur && cur.toLowerCase() === String(fp.machineGuid).toLowerCase()) {
+            guidResult = { ok: true, skipped: true };
+        }
+        else {
+            guidResult = writeWindowsMachineGuid(fp.machineGuid, mguidMode);
+        }
     }
     const pendingPath = path.join(os.tmpdir(), `cursor-mcp-fp-pending-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.json`);
-    fs.writeFileSync(pendingPath, JSON.stringify({ fp, ts: Date.now(), updateMachineGuid: !!fp.machineGuid }, null, 2), "utf-8");
+    fs.writeFileSync(pendingPath, JSON.stringify({ fp, ts: Date.now() }, null, 2), "utf-8");
     // 先备份一次，保留可回滚的快照（主进程仍然存活时执行）
     const backupDir = path.join(getCursorUserDir(), FP_BACKUP_DIRNAME);
     try {
@@ -482,39 +570,49 @@ function scheduleApplyAndRestart(fp) {
         windowsHide: true,
     });
     child.unref();
-    return { mode: "restart", pendingPath, backupDir, cursorExe, candidates, ps1Path };
+    return { mode: "restart", pendingPath, backupDir, cursorExe, candidates, ps1Path, guidResult };
 }
-/** 上车公用流程：弹三选一对话框 → 走重启或就地模式 → 回发 fcApplyResult */
+/** 上车公用流程：弹确认对话框 → 走重启或就地模式 → 回发 fcApplyResult */
 async function handleApplyFlow(webviewView, fp, meta) {
     const metaHost = (meta && meta.host) || "未知";
     const metaTs = (meta && meta.ts) ? new Date(meta.ts).toLocaleString() : "?";
     const header = `将用车头指纹覆盖本机 Cursor（已自动备份）。\n来源机器：${metaHost}\n时间：${metaTs}`;
     const isWin = process.platform === "win32";
-    const primary = isWin ? "关闭并应用 (推荐)" : "确认上车";
-    const secondary = "仅写入（需自行重启）";
-    const buttons = isWin ? [primary, secondary] : [primary];
+    const primary = isWin ? "关闭并应用" : "确认上车";
     const choice = await vscode.window.showWarningMessage(isWin
-        ? `${header}\n\n推荐：立即关闭 Cursor 并由后台 helper 写入 → 自动重启。\n仅写入：不关 Cursor，devDeviceId 可能被 Cursor 回写导致失败。`
-        : `${header}\n\n生效前需退出并重启 Cursor。`, { modal: true }, ...buttons);
+        ? `${header}\n\n立即关闭 Cursor 并由后台 helper 写入 → 自动重启。`
+        : `${header}\n\n生效前需退出并重启 Cursor。`, { modal: true }, primary);
     if (!choice) {
         webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "已取消" });
         return;
     }
-    if (choice === primary && isWin) {
+    if (isWin) {
         try {
             const s = scheduleApplyAndRestart(fp);
             const exeLines = (s.candidates && s.candidates.length)
                 ? s.candidates.map((p, i) => `  ${i + 1}. ${p}`).join("\n")
                 : "  （未识别到 Cursor 主程序，启动可能失败；请在设置中配置 cursorMcp.cursorExePath）";
+            let guidLine = "";
+            if (s.guidResult) {
+                if (s.guidResult.ok) {
+                    guidLine = s.guidResult.skipped
+                        ? "\nMachineGuid：已与车头一致，跳过"
+                        : "\nMachineGuid：已写入注册表";
+                }
+                else {
+                    guidLine = `\nMachineGuid：未写入（${s.guidResult.msg || "原因未知"}）`;
+                }
+            }
             webviewView.webview.postMessage({
                 command: "fcApplyResult",
                 ok: true,
-                msg: `已调度后台 helper：\n• 约 2-5 秒后 Cursor 将被关闭\n• 关闭完成后写入指纹（含 devDeviceId）\n• 随后自动重新打开 Cursor\n\n重启候选路径（按顺序尝试）：\n${exeLines}\n\n备份：${s.backupDir}\n任务记录：${s.pendingPath}\nhelper 日志：%TEMP%\\cursor-mcp-fache-helper-*.log`,
+                msg: `已调度后台 helper：\n• 约 2-5 秒后 Cursor 将被关闭\n• 关闭完成后写入指纹（含 devDeviceId）\n• 随后自动重新打开 Cursor\n\n重启候选路径（按顺序尝试）：\n${exeLines}\n\n备份：${s.backupDir}${guidLine}\n任务记录：${s.pendingPath}\nhelper 日志：%TEMP%\\cursor-mcp-fache-helper-*.log`,
                 mode: "restart",
                 pendingPath: s.pendingPath,
                 backupDir: s.backupDir,
                 cursorExe: s.cursorExe,
                 candidates: s.candidates || [],
+                guidResult: s.guidResult || null,
             });
         }
         catch (e) {
@@ -1608,6 +1706,13 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         });
                         return;
                     }
+                    void context.globalState.update(GLOBAL_STATE_LAST_PICKUP_KEY, {
+                        fp: parsed.fp,
+                        host: parsed.host || "",
+                        ts: parsed.ts || Date.now(),
+                        src: "ticket",
+                        savedAt: Date.now(),
+                    });
                     await handleApplyFlow(webviewView, parsed.fp, {
                         host: parsed.host,
                         ts: parsed.ts,
@@ -1722,6 +1827,13 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         webviewView.webview.postMessage({ command: "fcApplyResult", ok: false, msg: "服务端未返回指纹数据" });
                         return;
                     }
+                    void context.globalState.update(GLOBAL_STATE_LAST_PICKUP_KEY, {
+                        fp: parsed.fp,
+                        host: parsed.host || "",
+                        ts: parsed.ts || Date.now(),
+                        src: "cloud",
+                        savedAt: Date.now(),
+                    });
                     await handleApplyFlow(webviewView, parsed.fp, {
                         host: parsed.host,
                         ts: parsed.ts,
@@ -1734,6 +1846,34 @@ check_messages → 收到插件消息 → 【Cursor 完整回复】→ check_mes
                         await vscode.env.clipboard.writeText(t);
                         webviewView.webview.postMessage({ command: "fcClipboardResult", ok: true });
                     }
+                    return;
+                }
+                if (cmd === "fcVerifyFingerprint") {
+                    const saved = context.globalState.get(GLOBAL_STATE_LAST_PICKUP_KEY);
+                    if (!saved || typeof saved !== "object" || !saved.fp) {
+                        webviewView.webview.postMessage({
+                            command: "fcVerifyResult",
+                            ok: false,
+                            msg: "未找到上车记录：请先执行一次「上车」，之后再回来验证",
+                        });
+                        return;
+                    }
+                    const actual = readCursorFingerprint();
+                    const cmp = compareFingerprints(saved.fp, actual);
+                    webviewView.webview.postMessage({
+                        command: "fcVerifyResult",
+                        ok: true,
+                        allMatch: cmp.allMatch,
+                        matched: cmp.matched,
+                        checked: cmp.checked,
+                        rows: cmp.rows,
+                        expected: saved.fp,
+                        actual,
+                        host: saved.host || "",
+                        ts: saved.ts || 0,
+                        savedAt: saved.savedAt || 0,
+                        src: saved.src || "",
+                    });
                     return;
                 }
                 if (cmd === "updateCheck") {
@@ -2523,6 +2663,56 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
     .fc-ttl-custom { width: 90px; }
     .fc-ttl-hint { flex: 1; min-width: 120px; }
 
+    .fc-verify-box {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-primary);
+      font-size: 11px;
+      animation: fadeIn 0.3s;
+    }
+    .fc-verify-box.ok { border-color: rgba(166,227,161,0.45); background: rgba(166,227,161,0.08); }
+    .fc-verify-box.bad { border-color: rgba(243,139,168,0.45); background: rgba(243,139,168,0.08); }
+    .fc-verify-head {
+      font-weight: 700;
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+    .fc-verify-head .ok { color: var(--success); }
+    .fc-verify-head .bad { color: var(--error); }
+    .fc-verify-sub {
+      color: var(--text-secondary);
+      font-size: 10px;
+      margin-bottom: 8px;
+    }
+    .fc-verify-row {
+      display: grid;
+      grid-template-columns: 16px 1fr;
+      gap: 6px;
+      padding: 3px 0;
+      align-items: flex-start;
+      border-top: 1px dashed var(--border);
+    }
+    .fc-verify-row:first-of-type { border-top: none; }
+    .fc-verify-icon {
+      font-weight: 700;
+      line-height: 18px;
+      text-align: center;
+    }
+    .fc-verify-icon.match { color: var(--success); }
+    .fc-verify-icon.mismatch { color: var(--error); }
+    .fc-verify-icon.skipped { color: var(--text-secondary); }
+    .fc-verify-field {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.4;
+      word-break: break-all;
+    }
+    .fc-verify-field .k { color: var(--text-primary); font-weight: 600; }
+    .fc-verify-field .kv { color: var(--text-secondary); display: block; }
+    .fc-verify-field .kv.actual.mismatch { color: var(--error); }
+
     .feedback {
       margin-top: 8px;
       padding: 8px 10px;
@@ -2980,11 +3170,13 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
       <textarea id="fcTicketIn" class="fc-ticket" rows="3" placeholder="粘贴 sk- 密钥（20 位）或 FCT1. 长车票，插件会自动识别"></textarea>
       <div class="btn-row">
         <button class="btn btn-primary" id="fcApplyBtn">上车（覆盖本机指纹）</button>
+        <button class="btn" id="fcVerifyBtn" title="读取当前 Cursor 指纹，与上次车头指纹逐字段对比">验证指纹</button>
         <button class="btn btn-small" id="fcOpenBackupBtn2" title="打开备份目录">备份目录</button>
       </div>
       <div class="hint">
-        上车前会自动把本机旧指纹备份到 <code>Cursor/cursor-mcp-fp-backup</code>。<strong>请先退出 Cursor 再点「上车」</strong>，写入后重新启动 Cursor 才会生效。Windows 上若车票含 MachineGuid，会弹出 UAC 请求管理员权限写注册表。
+        上车前会自动把本机旧指纹备份到 <code>Cursor/cursor-mcp-fp-backup</code>。<strong>请先退出 Cursor 再点「上车」</strong>，写入后重新启动 Cursor 才会生效。Windows 上若车票含 MachineGuid，会弹出 UAC 请求管理员权限写注册表。重启 Cursor 后回到此处点「验证指纹」，可逐字段对比是否与车头一致。
       </div>
+      <div class="fc-verify-box" id="fcVerifyBox" style="display:none"></div>
     </div>
 
     <div class="feedback" id="fcFeedback"></div>
@@ -3961,6 +4153,8 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
       var copyBtn = document.getElementById('fcCopyBtn');
       var ticketIn = document.getElementById('fcTicketIn');
       var applyBtn = document.getElementById('fcApplyBtn');
+      var verifyBtn = document.getElementById('fcVerifyBtn');
+      var verifyBox = document.getElementById('fcVerifyBox');
       var fbEl = document.getElementById('fcFeedback');
       var roleToggleBtn = document.getElementById('fcToggleRoleBtn');
       var cloudPubBtn = document.getElementById('fcCloudPubBtn');
@@ -4099,6 +4293,62 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
           fcFeedback('error', '无法识别：应为 sk- 开头 20 位密钥 或 FCT1. 开头的长车票');
         }
       });
+      if (verifyBtn) verifyBtn.addEventListener('click', function () {
+        verifyBtn.disabled = true;
+        fcFeedback('pending', '正在读取本机 Cursor 指纹并与车头对比…');
+        vscodeApi.postMessage({ command: 'fcVerifyFingerprint' });
+      });
+      function esc(s) {
+        return String(s == null ? '' : s)
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      }
+      function renderVerifyResult(msg) {
+        if (!verifyBox) return;
+        if (!msg.ok) {
+          verifyBox.className = 'fc-verify-box bad';
+          verifyBox.innerHTML = '<div class="fc-verify-head"><span class="bad">验证失败</span></div>'
+            + '<div class="fc-verify-sub">' + esc(msg.msg || '') + '</div>';
+          verifyBox.style.display = '';
+          return;
+        }
+        var ok = !!msg.allMatch;
+        verifyBox.className = 'fc-verify-box ' + (ok ? 'ok' : 'bad');
+        var headHtml = ok
+          ? '<span class="ok">✓ 全部一致（' + msg.matched + '/' + msg.checked + '）</span>'
+          : '<span class="bad">✗ ' + (msg.checked - msg.matched) + ' 项不一致（' + msg.matched + '/' + msg.checked + '）</span>';
+        var srcLabel = msg.src === 'cloud' ? '云端 sk-' : (msg.src === 'ticket' ? '本地 FCT1.' : '');
+        var savedAt = msg.savedAt ? new Date(msg.savedAt).toLocaleString() : '';
+        var subHtml = '车头：' + esc(msg.host || '未知')
+          + (srcLabel ? ' · 来源：' + esc(srcLabel) : '')
+          + (savedAt ? ' · 上车时间：' + esc(savedAt) : '');
+        var rowsHtml = '';
+        (msg.rows || []).forEach(function (r) {
+          var icon = r.status === 'match' ? '✓' : (r.status === 'mismatch' ? '✗' : '—');
+          var iconCls = r.status;
+          if (r.status === 'skipped') {
+            rowsHtml += '<div class="fc-verify-row">'
+              + '<div class="fc-verify-icon ' + iconCls + '">' + icon + '</div>'
+              + '<div class="fc-verify-field">'
+              + '<span class="k">' + esc(r.key) + '</span>'
+              + '<span class="kv">车头未提供此字段（跳过）</span>'
+              + '</div></div>';
+            return;
+          }
+          var mismatchCls = r.status === 'mismatch' ? ' mismatch' : '';
+          rowsHtml += '<div class="fc-verify-row">'
+            + '<div class="fc-verify-icon ' + iconCls + '">' + icon + '</div>'
+            + '<div class="fc-verify-field">'
+            + '<span class="k">' + esc(r.key) + '</span>'
+            + '<span class="kv">车头：' + esc(r.expected || '(空)') + '</span>'
+            + '<span class="kv actual' + mismatchCls + '">本机：' + esc(r.actual || '(空)') + '</span>'
+            + '</div></div>';
+        });
+        verifyBox.innerHTML = '<div class="fc-verify-head">' + headHtml + '</div>'
+          + '<div class="fc-verify-sub">' + subHtml + '</div>'
+          + rowsHtml;
+        verifyBox.style.display = '';
+      }
 
       function formatRemain(ms) {
         if (ms <= 0) return '已过期';
@@ -4172,6 +4422,18 @@ function getHtml(webview, nonce, extensionVersion, payStoreUrl) {
               }
             } else {
               fcFeedback('error', msg.msg || '上车失败');
+            }
+            break;
+          case 'fcVerifyResult':
+            if (verifyBtn) verifyBtn.disabled = false;
+            renderVerifyResult(msg);
+            if (msg.ok) {
+              fcFeedback(msg.allMatch ? 'success' : 'error',
+                msg.allMatch
+                  ? '验证通过：当前指纹与车头完全一致'
+                  : '有 ' + (msg.checked - msg.matched) + ' 项不一致，请查看下方详情');
+            } else {
+              fcFeedback('error', msg.msg || '验证失败');
             }
             break;
           case 'fcCloudPublishResult':

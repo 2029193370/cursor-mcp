@@ -111,6 +111,17 @@
 					"default": "",
 					"description": "发车云端 publish 接口的访问令牌：若服务端设置了 PUBLISH_TOKEN，则本项需填同一值；请求时会带 Authorization: Bearer <token>。留空表示不带。"
 				},
+				"cursorMcp.facheSyncMachineGuid": {
+					"type": "string",
+					"enum": ["auto", "always", "never"],
+					"default": "auto",
+					"enumDescriptions": [
+						"auto（默认，推荐）：点一次上车就把 MachineGuid 一并写好。当前 Cursor 已以管理员身份启动时直写（无 UAC）；否则自动弹一次 UAC 提权写入，用户点「是」即可完成。",
+						"always：无论是否已提权，都强制走 UAC 提权路径（即使已是管理员也会再弹一次），用于测试或保守场景。",
+						"never：完全不读、不写 MachineGuid；「发车」车票里也不包含该字段。"
+					],
+					"description": "「发车/上车」是否同步 Windows 注册表 HKLM 下的 MachineGuid（仅 Windows 生效）。"
+				},
 				"cursorMcp.updateFeedUrl": {
 					"type": "string",
 					"default": "https://api.github.com/repos/2029193370/cursor-mcp/releases/latest",
